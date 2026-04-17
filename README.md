@@ -10,6 +10,20 @@ StorageMan is a NestJS dashboard for monitoring Storj storage nodes and Sia host
 - Storj payout, held amount, distributed amount, audit, QUIC, and disk summaries.
 - Static frontend served by NestJS with API endpoints at `/api/storj` and `/api/sia`.
 
+## Screenshots
+
+![Overview](docs/screenshots/overview.png)
+
+*Overview dashboard with Storj and Sia aggregate metrics.*
+
+![Sia view](docs/screenshots/sia.png)
+
+*Sia dashboard view showing node storage, earnings, wallet, and contracts.*
+
+![Storj view](docs/screenshots/storj.png)
+
+*Storj dashboard view showing payout, disk, bandwidth, and audit data.*
+
 ## Getting Started
 
 1. Install dependencies (requires Node.js 18+):

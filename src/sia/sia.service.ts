@@ -1242,6 +1242,10 @@ export class SiaService {
   }
 
   async fetchSummary(options?: { month?: string; range?: SiaSummaryRange }): Promise<SiaSummary> {
+    if (process.env.DEMO_MODE === 'true') {
+      return this.getMockSiaSummary(options);
+    }
+
     const config = this.buildSummaryRequestConfig(options);
     const calendarBaselineStart =
       config.mode === 'calendar' ? config.periodStart : this.getPeriodStart();
@@ -1580,6 +1584,107 @@ export class SiaService {
       previousPeriodStart: config.previousPeriodStart,
       rollingBaselineStart: config.rollingBaselineStart,
       nodes,
+      aggregate,
+    };
+  }
+
+  private getMockSiaSummary(options?: { month?: string; range?: SiaSummaryRange }): SiaSummary {
+    const now = new Date();
+    const periodStart = options?.month ? this.parsePeriodFromMonth(options.month).periodStart : this.getPeriodStart();
+    const periodEnd = options?.month ? this.parsePeriodFromMonth(options.month).periodEnd : this.toIsoString(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)));
+
+    const mockNodes: SiaNodeStatus[] = [
+      {
+        host: 'demo-sia-1.example.com:9980',
+        status: 'ok',
+        metrics: [
+          { metric: 'storage', current: { potential: 150, earned: 140 }, total: { potential: 300, earned: 280 } },
+          { metric: 'ingress', current: { potential: 50, earned: 45 }, total: { potential: 100, earned: 90 } },
+        ],
+        totals: {
+          current: { potential: 200, earned: 185 },
+          currentMonth: { potential: 200, earned: 185 },
+          total: { potential: 400, earned: 370 },
+        },
+        storage: {
+          usedBytes: 1073741824, // 1 GB
+          capacityBytes: 2147483648, // 2 GB
+          freeBytes: 1073741824,
+        },
+        wallet: {
+          confirmed: 1000,
+          spendable: 950,
+          unconfirmedIncoming: 10,
+          unconfirmedOutgoing: 5,
+        },
+        contracts: {
+          active: { currentCount: 5, deltaCount: 1 },
+          successful: { currentCount: 20, deltaCount: 3 },
+          renewed: { currentCount: 15, deltaCount: 2 },
+          failed: { currentCount: 2, deltaCount: 0 },
+        },
+      },
+      {
+        host: 'demo-sia-2.example.com:9985',
+        status: 'ok',
+        metrics: [
+          { metric: 'storage', current: { potential: 120, earned: 110 }, total: { potential: 250, earned: 220 } },
+          { metric: 'egress', current: { potential: 30, earned: 25 }, total: { potential: 60, earned: 50 } },
+        ],
+        totals: {
+          current: { potential: 150, earned: 135 },
+          currentMonth: { potential: 150, earned: 135 },
+          total: { potential: 310, earned: 270 },
+        },
+        storage: {
+          usedBytes: 536870912, // 512 MB
+          capacityBytes: 1073741824, // 1 GB
+          freeBytes: 536870912,
+        },
+        wallet: {
+          confirmed: 800,
+          spendable: 780,
+          unconfirmedIncoming: 5,
+          unconfirmedOutgoing: 0,
+        },
+        contracts: {
+          active: { currentCount: 3, deltaCount: 0 },
+          successful: { currentCount: 18, deltaCount: 2 },
+          renewed: { currentCount: 12, deltaCount: 1 },
+          failed: { currentCount: 1, deltaCount: 0 },
+        },
+      },
+      {
+        host: 'demo-sia-3.example.com:9990',
+        status: 'error',
+        message: 'Connection timeout',
+      },
+    ];
+
+    const aggregate = {
+      current: { potential: 350, earned: 320 },
+      currentMonth: { potential: 350, earned: 320 },
+      total: { potential: 710, earned: 640 },
+      storage: {
+        usedBytes: 1610612736, // 1.5 GB
+        capacityBytes: 3221225472, // 3 GB
+        freeBytes: 1610612736,
+      },
+      contracts: {
+        active: { currentCount: 8, deltaCount: 1 },
+        successful: { currentCount: 38, deltaCount: 5 },
+        renewed: { currentCount: 27, deltaCount: 3 },
+        failed: { currentCount: 3, deltaCount: 0 },
+      },
+    };
+
+    return {
+      periodStart,
+      periodEnd,
+      periodMode: options?.range ? 'range' : 'calendar',
+      periodLabel: options?.range ? `Last ${options.range}` : 'Current month',
+      periodShortLabel: options?.range || 'Current',
+      nodes: mockNodes,
       aggregate,
     };
   }

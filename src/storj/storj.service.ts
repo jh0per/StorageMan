@@ -612,6 +612,10 @@ export class StorjService {
   }
 
   async fetchSummary(options?: { range?: StorjSummaryRange }): Promise<StorjSummary> {
+    if (process.env.DEMO_MODE === 'true') {
+      return this.getMockStorjSummary(options);
+    }
+
     void options;
     const nodes = await Promise.all(
       this.configuredNodes.map(async (nodeConfig): Promise<StorjNodeStatus> => {
@@ -940,6 +944,86 @@ export class StorjService {
 
     return {
       nodes,
+      aggregate,
+    };
+  }
+
+  private getMockStorjSummary(options?: { range?: StorjSummaryRange }): StorjSummary {
+    const mockNodes: StorjNodeStatus[] = [
+      {
+        host: 'demo-storj-1.example.com:14002',
+        status: 'ok',
+        current: { grossUsd: 150, heldUsd: 10, netUsd: 140 },
+        total: { grossUsd: 300, heldUsd: 20, netUsd: 280 },
+        disk: {
+          usedBytes: 1073741824, // 1 GB
+          availableBytes: 2147483648, // 2 GB
+          trashBytes: 0,
+          freeBytes: 1073741824,
+        },
+        bandwidth: {
+          totalBytes: 536870912, // 512 MB
+          ingressBytes: 268435456,
+          egressBytes: 268435456,
+        },
+        audits: [
+          { satelliteName: 'us-central-1', auditScore: 1.0, suspensionScore: 1.0, onlineScore: 1.0 },
+        ],
+        auditSummary: { auditScore: 1.0, suspensionScore: 1.0, onlineScore: 1.0 },
+        quicStatus: 'ok',
+      },
+      {
+        host: 'demo-storj-2.example.com:14003',
+        status: 'ok',
+        current: { grossUsd: 120, heldUsd: 8, netUsd: 112 },
+        total: { grossUsd: 250, heldUsd: 15, netUsd: 235 },
+        disk: {
+          usedBytes: 536870912, // 512 MB
+          availableBytes: 1073741824, // 1 GB
+          trashBytes: 0,
+          freeBytes: 536870912,
+        },
+        bandwidth: {
+          totalBytes: 268435456, // 256 MB
+          ingressBytes: 134217728,
+          egressBytes: 134217728,
+        },
+        audits: [
+          { satelliteName: 'eu-west-1', auditScore: 0.99, suspensionScore: 1.0, onlineScore: 0.98 },
+        ],
+        auditSummary: { auditScore: 0.99, suspensionScore: 1.0, onlineScore: 0.98 },
+        quicStatus: 'ok',
+      },
+      {
+        host: 'demo-storj-3.example.com:14004',
+        status: 'error',
+        message: 'Connection refused',
+      },
+    ];
+
+    const aggregate = {
+      current: { grossUsd: 270, netUsd: 252, heldUsd: 18, distributedUsd: 0 },
+      total: { grossUsd: 550, netUsd: 515, heldUsd: 35, distributedUsd: 0 },
+      disk: {
+        usedBytes: 1610612736, // 1.5 GB
+        availableBytes: 3221225472, // 3 GB
+        trashBytes: 0,
+        freeBytes: 1610612736,
+      },
+      bandwidth: {
+        totalBytes: 805306368, // 768 MB
+        ingressBytes: 402653184,
+        egressBytes: 402653184,
+      },
+      bandwidthMonth: {
+        totalBytes: 1073741824, // 1 GB
+        ingressBytes: 536870912,
+        egressBytes: 536870912,
+      },
+    };
+
+    return {
+      nodes: mockNodes,
       aggregate,
     };
   }
