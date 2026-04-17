@@ -1,0 +1,123 @@
+body {
+  font-family: Arial, sans-serif;
+  margin: 20px;
+  background-color: #f8f8f8;
+}
+
+/* General Styles */
+h1 {
+  text-align: center;
+  color: #333; /* Dark gray for a business look */
+  font-family: 'Arial', sans-serif;
+  font-size: 24px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+/* Table Container */
+.table-container {
+  display: flex;
+  justify-content: space-around;
+  gap: 50px;
+  width: 80%;
+  margin: 20px auto;
+  overflow-x: auto;
+  background: #fff; /* Clean white background */
+  padding: 15px;
+  border-radius: 10px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+}
+
+/* Table Styling */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* Table Header */
+.mainheader {
+  background: #444; /* Dark gray header */
+  color: #fff;
+  font-weight: bold;
+  text-transform: uppercase;
+  font-size: 15px;
+  padding: 12px;
+}
+
+/* Subheader */
+.subheader {
+  font-weight: bold;
+  background: #666; /* Mid gray for contrast */
+  text-align: center;
+  padding: 8px 10px;
+  font-size: 14px;
+  color: #fff;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  border-radius: 5px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+/* Table Cells */
+th, td {
+  padding: 10px;
+  text-align: center;
+  border: 1px solid #ddd; /* Light gray border */
+  word-wrap: break-word;
+  white-space: normal;
+  font-size: 13px;
+  transition: all 0.2s ease-in-out;
+}
+
+/* Alternating Row Colors */
+tr:nth-child(even) {
+  background-color: #f5f5f5; /* Very light gray */
+}
+
+/* Hover Effect */
+tr:hover {
+  background-color: #e0e0e0; /* Subtle darkening on hover */
+  transition: 0.2s ease-in-out;
+}
+
+/* Bold Headers */
+.bh {
+  font-weight: bold;
+  color: #444;
+  font-size: 14px;
+}
+
+/* Bold Text */
+.b {
+  font-weight: bold;
+  color: #333;
+  font-size: 12px;
+}
+
+/* .bhw inherits from .bh, but forces white text */
+.w {
+  font-weight: bold;
+  font-size: 14px;
+  color: #fff !important;
+}
+
+.lnk {
+  color: inherit; /* Same as normal text */
+  text-decoration: none; /* No underline */
+  cursor: pointer;
+}
+
+.lnk:hover {
+  text-decoration: underline; /* Optional: Underline on hover */
+}
+
+.bggreen {
+  background-color: #3C6E47 !important;
+  
+}
+.td-left {
+  text-align: left;
+}

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html class="theme-operator" lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StorageMan | Storage Insights</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css?v=20260416-material-standard-21" />
+  </head>
+  <body class="theme-operator">
+    <main class="layout">
+      <header class="page-header">
+        <div class="heading">
+          <h1>Revenue Metrics</h1>
+          <p class="subtitle">
+            Consolidated overview for your Sia renters and Storj storage nodes (current month).
+          </p>
+        </div>
+        <div class="actions">
+          <div class="theme-switcher" role="group" aria-label="Theme switcher">
+            <button
+              class="theme-switcher__button"
+              type="button"
+              data-theme="theme-operator"
+              aria-label="Dark theme"
+              title="Dark theme"
+            >
+              <svg class="theme-switcher__icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79Z"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="1.8"
+                />
+              </svg>
+              <span class="sr-only">Dark theme</span>
+            </button>
+            <button
+              class="theme-switcher__button"
+              type="button"
+              data-theme="theme-daylight"
+              aria-label="Light theme"
+              title="Light theme"
+            >
+              <svg class="theme-switcher__icon" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8" />
+                <path
+                  d="M12 2v2.2M12 19.8V22M4.93 4.93l1.56 1.56M17.51 17.51l1.56 1.56M2 12h2.2M19.8 12H22M4.93 19.07l1.56-1.56M17.51 6.49l1.56-1.56"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-linecap="round"
+                  stroke-width="1.8"
+                />
+              </svg>
+              <span class="sr-only">Light theme</span>
+            </button>
+          </div>
+          <button id="refresh-button" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <div class="view-tabs" role="tablist" aria-label="Dashboard views">
+        <button
+          id="tab-overview"
+          class="view-tabs__button is-active"
+          type="button"
+          role="tab"
+          data-view="overview"
+          aria-selected="true"
+          aria-controls="view-overview"
+        >
+          Overview
+        </button>
+        <button
+          id="tab-sia"
+          class="view-tabs__button"
+          type="button"
+          role="tab"
+          data-view="sia"
+          aria-selected="false"
+          aria-controls="view-sia"
+          tabindex="-1"
+        >
+          Sia
+        </button>
+        <button
+          id="tab-storj"
+          class="view-tabs__button"
+          type="button"
+          role="tab"
+          data-view="storj"
+          aria-selected="false"
+          aria-controls="view-storj"
+          tabindex="-1"
+        >
+          Storj
+        </button>
+      </div>
+
+      <div class="view-panels">
+        <section
+          class="view-panel"
+          id="view-overview"
+          role="tabpanel"
+          aria-labelledby="tab-overview"
+        >
+          <div class="overview-stack">
+            <section class="panel panel--problems" id="panel-overview-problems" aria-live="polite" hidden>
+              <div class="panel-header">
+                <h2>Problems</h2>
+                <div class="panel-header__actions panel-header__actions--placeholder" aria-hidden="true"></div>
+              </div>
+              <p class="panel-submeta panel-submeta--spacer" aria-hidden="true">&nbsp;</p>
+              <div id="overview-problems"></div>
+            </section>
+
+            <div class="panels panels--overview">
+              <section class="panel panel--sia" id="panel-overview-sia" aria-live="polite">
+                <div class="panel-header">
+                  <h2>Sia Overview</h2>
+                  <div class="period-picker" data-overview-range-picker>
+                    <button
+                      class="period-picker__trigger"
+                      type="button"
+                      aria-haspopup="menu"
+                      aria-expanded="false"
+                      aria-label="Select Sia overview range"
+                    >
+                      <span class="period-picker__value overview-range-label"></span>
+                      <span class="period-picker__icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" focusable="false">
+                          <path
+                            d="M7 2a1 1 0 0 1 1 1v1h8V3a1 1 0 1 1 2 0v1h1a3 3 0 0 1 3 3v11a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h1V3a1 1 0 0 1 1-1Zm12 8H5v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1Zm-1-4H6a1 1 0 0 0-1 1v1h14V7a1 1 0 0 0-1-1Z"
+                            fill="currentColor"
+                          />
+                        </svg>
+                      </span>
+                    </button>
+                    <div class="period-picker__menu overview-range-menu" role="menu" hidden></div>
+                  </div>
+                </div>
+                <p id="overview-sia-period" class="panel-submeta" aria-live="polite"></p>
+                <div id="overview-sia-totals" class="totals-card" hidden></div>
+              </section>
+
+              <section class="panel panel--storj" id="panel-overview-storj" aria-live="polite">
+                <div class="panel-header">
+                  <h2>Storj Overview</h2>
+                  <div class="panel-header__actions panel-header__actions--placeholder" aria-hidden="true"></div>
+                </div>
+                <p class="panel-submeta panel-submeta--spacer" aria-hidden="true">&nbsp;</p>
+                <div id="overview-storj-totals" class="totals-card" hidden></div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section
+          class="view-panel"
+          id="view-sia"
+          role="tabpanel"
+          aria-labelledby="tab-sia"
+          hidden
+        >
+          <div class="panels panels--detail">
+            <section class="panel panel--sia" id="panel-sia" aria-live="polite">
+              <div class="panel-header">
+                <h2>Sia Nodes</h2>
+                <div class="period-picker" data-overview-range-picker>
+                  <button
+                    class="period-picker__trigger"
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded="false"
+                    aria-label="Select Sia range"
+                  >
+                    <span class="period-picker__value overview-range-label"></span>
+                    <span class="period-picker__icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" focusable="false">
+                        <path
+                          d="M7 2a1 1 0 0 1 1 1v1h8V3a1 1 0 1 1 2 0v1h1a3 3 0 0 1 3 3v11a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h1V3a1 1 0 0 1 1-1Zm12 8H5v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1Zm-1-4H6a1 1 0 0 0-1 1v1h14V7a1 1 0 0 0-1-1Z"
+                          fill="currentColor"
+                        />
+                      </svg>
+                    </span>
+                  </button>
+                  <div class="period-picker__menu overview-range-menu" role="menu" hidden></div>
+                </div>
+              </div>
+              <p id="sia-period" class="panel-submeta" aria-live="polite"></p>
+              <div class="table-container">
+                <table>
+                  <tbody id="sia-body" data-columns="3">
+                    <tr class="placeholder">
+                      <td colspan="3">Loading…</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section
+          class="view-panel"
+          id="view-storj"
+          role="tabpanel"
+          aria-labelledby="tab-storj"
+          hidden
+        >
+          <div class="panels panels--detail">
+            <section class="panel panel--storj" id="panel-storj" aria-live="polite">
+              <div class="panel-header">
+                <h2>Storj Nodes</h2>
+                <div class="panel-header__actions panel-header__actions--placeholder" aria-hidden="true"></div>
+              </div>
+              <p class="panel-submeta panel-submeta--spacer" aria-hidden="true">&nbsp;</p>
+              <div class="table-container">
+                <table>
+                  <tbody id="storj-body" data-columns="4">
+                    <tr class="placeholder">
+                      <td colspan="4">Loading…</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
+    </main>
+    <script type="module" src="main.js?v=20260416-material-standard-21"></script>
+  </body>
+</html>

@@ -1,0 +1,100 @@
+body {
+  font-family: Arial, sans-serif;
+  margin: 20px;
+  background-color: #f4f4f9;
+}
+
+/* General Styles */
+h1 {
+  text-align: center;
+  color: #2C5F2D; /* Deep green for a business-professional look */
+  font-family: 'Arial', sans-serif;
+  font-size: 24px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+/* Table Container */
+.table-container {
+  width: 50%;
+  margin: 20px auto;
+  overflow-x: auto;
+  background: #F7F9F8; /* Soft greenish-white background */
+  padding: 15px;
+  border-radius: 10px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1); /* Subtle shadow for professionalism */
+}
+
+/* Table Styling */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+  table-layout: fixed;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* Table Header */
+.mainheader {
+  background: linear-gradient(90deg, #4A7C59, #3C6E47); /* Muted, elegant green gradient */
+  color: white;
+  font-weight: bold;
+  text-transform: uppercase;
+  font-size: 15px;
+  padding: 12px;
+}
+
+/* Subheader */
+.subheader {
+  font-weight: bold;
+  background: linear-gradient(90deg, #6D8F72, #5A7D61); /* Softer green tones */
+  text-align: center;
+  padding: 8px 10px;
+  font-size: 14px;
+  color: white;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  border-radius: 5px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+/* Table Cells */
+th, td {
+  padding: 10px;
+  text-align: center;
+  border: 1px solid #DCE6D8; /* Soft green border */
+  word-wrap: break-word;
+  white-space: normal;
+  font-size: 13px;
+  transition: all 0.2s ease-in-out;
+}
+
+/* Alternating Row Colors */
+tr:nth-child(even) {
+  background-color: #EEF3EC; /* Very light green-gray */
+}
+
+/* Hover Effect */
+tr:hover {
+  background-color: #D4E4D1; /* Subtle green on hover */
+  transition: 0.2s ease-in-out;
+}
+
+/* Bold Headers */
+.bh {
+  font-weight: bold;
+  color: #3C6E47;
+  font-size: 14px;
+}
+
+/* Bold Text */
+.b {
+  font-weight: bold;
+  color: #2C5F2D;
+  font-size: 12px;
+}
+
+.w {
+  color: #FFFFFF
+}
