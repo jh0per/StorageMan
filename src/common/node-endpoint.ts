@@ -10,8 +10,8 @@ export type NodeScheme = 'http' | 'https';
  * scheme's port (`https://host` is port 443, `http://host` port 80). Same rules as the
  * StorageMan app's `NodeEndpoint`, plus one that fetch needs here: the host must read the same to
  * the WHATWG URL parser (see [readsAsSameHost]). The app holds new addresses to the numeric part
- * of that rule (`NodeEndpoint.readsAsAnotherHost`), not to the `xn--` check, and keeps reading
- * nodes it saved before.
+ * of that rule (`NodeEndpoint.readsAsAnotherHost`), not to the parser's `xn--` checks, and keeps
+ * reading nodes it saved before.
  */
 export interface NodeEndpoint {
   scheme: NodeScheme;
@@ -113,8 +113,9 @@ export function parseNodeEndpoint(raw: string): NodeEndpoint | undefined {
 /**
  * fetch and the browser read a URL with the WHATWG parser, which rejects some names the grammar
  * above allows (an IPv4 octet over 255 such as `256.1.1.1`, a numeric last label such as
- * `host.123` or `1.2.3.4.5`, a malformed `xn--` label) and reads other numeric names as a
- * different IPv4 address (`010.0.0.1` is 8.0.0.1, `0x7f.1` is 127.0.0.1, `1.2.3` is 1.2.0.3).
+ * `host.123` or `1.2.3.4.5`, and, depending on the Node.js version, an `xn--` label that is not
+ * valid Punycode) and reads other numeric names as a different IPv4 address (`010.0.0.1` is
+ * 8.0.0.1, `0x7f.1` is 127.0.0.1, `1.2.3` is 1.2.0.3).
  * The rule is any difference between the parsed hostname and the text, ignoring case, so a name
  * written back as the same address in another form (`192.168.1.05` as 192.168.1.5) is refused too.
  * The address is then invalid, so a node is never requested or linked on a host other than the

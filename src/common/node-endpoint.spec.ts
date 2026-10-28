@@ -93,7 +93,6 @@ describe('parseNodeEndpoint', () => {
     'host.123:9980',
     'https://example.123',
     'node.0x1f:9980',
-    'https://xn--a',
     // Read by it as another IPv4 address: 8.0.0.1, 127.0.0.1, 1.2.0.3, 255.255.255.255.
     '010.0.0.1:9980',
     '0x7f.1:9980',
