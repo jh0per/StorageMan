@@ -1,8 +1,25 @@
+import type { NodeErrorKind, NodeFailureHealth } from '../common/node-request';
+
+/**
+ * USD amounts of one period. For a lifetime total: gross = net + held balance, net is what the
+ * paystubs record as paid (earned after held, held amount returned included; a month the
+ * satellites hold back counts once it is paid) plus the open months' estimated payout, held is the
+ * amount still withheld (held minus returned), distributed is what the satellites actually
+ * transferred (it may include carried-over amounts and the next month's prepayment, so it is
+ * neither a part of net nor added to it).
+ */
 export interface StorjPayoutSnapshot {
   grossUsd: number;
   heldUsd: number;
   netUsd: number;
   distributedUsd?: number;
+  /**
+   * Lifetime totals only: true when a month is missing from the total. For a node: its payout
+   * history (paystubs) could not be read, so the total holds only the previous and current month,
+   * or a month before the previous one has no paystubs yet. For the aggregate: any node's total
+   * is partial, or a node failed and is left out of the sums.
+   */
+  isPartial?: boolean;
 }
 
 export interface StorjDiskUsage {
@@ -35,6 +52,8 @@ export interface StorjBandwidthStats {
   changeRepairBytes?: number;
   changeAuditBytes?: number;
   changeSampleHours?: number;
+  /** UTC start of the complete day the change describes (compared with the day before it). */
+  changeDayStart?: string;
 }
 
 export interface StorjBandwidthMonthly {
@@ -60,6 +79,8 @@ export type StorjQuicStatus = 'ok' | 'misconfigured' | 'offline';
 
 export interface StorjNodeSuccess {
   host: string;
+  /** `scheme://host:port` of the node dashboard. */
+  baseUrl?: string;
   status: 'ok';
   current: StorjPayoutSnapshot;
   total: StorjPayoutSnapshot;
@@ -73,8 +94,11 @@ export interface StorjNodeSuccess {
 
 export interface StorjNodeFailure {
   host: string;
+  baseUrl?: string;
   status: 'error';
   message: string;
+  errorKind: NodeErrorKind;
+  health: NodeFailureHealth;
 }
 
 export type StorjNodeStatus = StorjNodeSuccess | StorjNodeFailure;

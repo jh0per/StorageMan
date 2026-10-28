@@ -1,3 +1,5 @@
+import type { NodeErrorKind, NodeFailureHealth } from '../common/node-request';
+
 export interface SiaMetricSnapshot {
   potential: number;
   earned: number;
@@ -23,11 +25,16 @@ export interface SiaStorageUsage {
   changeRangeLabel?: string;
 }
 
+/**
+ * Wallet in SC. From hostd `GET /api/wallet`: incoming is its `unconfirmed` balance, outgoing is
+ * the confirmed amount that is not spendable (reserved or spent by pool transactions).
+ */
 export interface SiaWalletSummary {
   confirmed: number;
   spendable: number;
   unconfirmedIncoming: number;
   unconfirmedOutgoing: number;
+  immature?: number;
   lockedCollateral?: number;
 }
 
@@ -45,6 +52,8 @@ export interface SiaContractSummary {
 
 export interface SiaNodeSuccess {
   host: string;
+  /** `scheme://host:port` of the hostd API and UI. */
+  baseUrl?: string;
   status: 'ok';
   metrics: SiaMetricRow[];
   totals: {
@@ -59,8 +68,11 @@ export interface SiaNodeSuccess {
 
 export interface SiaNodeFailure {
   host: string;
+  baseUrl?: string;
   status: 'error';
   message: string;
+  errorKind: NodeErrorKind;
+  health: NodeFailureHealth;
 }
 
 export type SiaNodeStatus = SiaNodeSuccess | SiaNodeFailure;

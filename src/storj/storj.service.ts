@@ -1,5 +1,23 @@
 import { Injectable } from '@nestjs/common';
+import { displayNodeHost, nodeBaseUrl } from '../common/node-endpoint';
+import { centsToDollars, toNumberOrUndefined } from '../common/node-numbers';
+import {
+  getNodeArray,
+  getNodeObject,
+  invalidResponse,
+  toNodeFailure,
+} from '../common/node-request';
 import { getRuntimeEnv } from '../runtime-env';
+import {
+  BandwidthDailyEntry,
+  computeBandwidthDailySummary,
+  computeLifetimeSnapshot,
+  formatIsoUtc,
+  paystubPeriod,
+  PaystubTotals,
+  sumPaystubs,
+  utcDayStart,
+} from './storj-calculations';
 import {
   StorjAuditScore,
   StorjAuditSummary,
@@ -19,23 +37,6 @@ export type StorjSummaryRange = '1d' | '7d' | '1m' | '3m' | '1y' | 'all';
 interface StorageDailyEntry {
   timestamp: number;
   usedBytes: number;
-}
-
-interface BandwidthDailyEntry {
-  timestamp: number;
-  totalBytes: number;
-  ingressBytes: number;
-  egressBytes: number;
-  repairIngressBytes: number;
-  repairEgressBytes: number;
-  repairBytes: number;
-  auditBytes: number;
-}
-
-interface PaystubTotals {
-  paid: number;
-  held: number;
-  distributed: number;
 }
 
 interface StorjNodeConfig {
@@ -96,37 +97,26 @@ export class StorjService {
       .filter((entry): entry is StorjNodeConfig => Boolean(entry));
   }
 
-  private extractDollar(value?: number | null): number {
-    if (!value) {
-      return 0;
-    }
-    return value / 100;
+  /** Wall clock: the paystub range end, the previous paystub period and the UTC day. */
+  private now(): Date {
+    return new Date();
   }
 
-  private computeSnapshot(entry?: {
-    egressBandwidthPayout?: number;
-    egressRepairAuditPayout?: number;
-    diskSpacePayout?: number;
-    held?: number;
-    payout?: number;
-  }): { grossUsd: number; heldUsd: number; netUsd: number } {
-    if (!entry) {
-      return {
-        grossUsd: 0,
-        heldUsd: 0,
-        netUsd: 0,
-      };
-    }
-
+  /** An estimated-payout month (amounts in cents). */
+  private computeSnapshot(entry: Record<string, unknown>): {
+    grossUsd: number;
+    heldUsd: number;
+    netUsd: number;
+  } {
     const gross =
-      this.extractDollar(entry.egressBandwidthPayout) +
-      this.extractDollar(entry.egressRepairAuditPayout) +
-      this.extractDollar(entry.diskSpacePayout);
+      centsToDollars(entry.egressBandwidthPayout) +
+      centsToDollars(entry.egressRepairAuditPayout) +
+      centsToDollars(entry.diskSpacePayout);
 
     return {
       grossUsd: gross,
-      heldUsd: this.extractDollar(entry.held),
-      netUsd: this.extractDollar(entry.payout),
+      heldUsd: centsToDollars(entry.held),
+      netUsd: centsToDollars(entry.payout),
     };
   }
 
@@ -135,57 +125,25 @@ export class StorjService {
   }
 
   private getPaystubRangeEnd(): string {
-    const now = new Date();
-    const year = now.getUTCFullYear();
-    const month = String(now.getUTCMonth() + 1).padStart(2, '0');
-    return `${year}-${month}`;
+    const now = this.now();
+    return paystubPeriod(now.getUTCFullYear(), now.getUTCMonth());
   }
 
-  private parseMicroDollar(value: unknown): number {
-    if (value === null || value === undefined) {
-      return 0;
-    }
-    const numeric = typeof value === 'string' ? Number(value) : (value as number);
-    if (Number.isNaN(numeric)) {
-      return 0;
-    }
-
-    return numeric / 1_000_000;
-  }
-
-  private async fetchPaystubTotals(host: string): Promise<PaystubTotals> {
+  /**
+   * Every paystub from the first possible period to this month. A range without paystubs (a new
+   * node) comes back as `null`, the empty list.
+   */
+  private async fetchPaystubTotals(baseUrl: string): Promise<PaystubTotals> {
     const start = this.getPaystubRangeStart();
     const end = this.getPaystubRangeEnd();
-    const url = `http://${host}/api/heldamount/paystubs/${start}/${end}`;
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(`Paystub request failed with status ${response.status}`);
-    }
-
-    const stubs = (await response.json()) as Array<Record<string, unknown>>;
-    const totals = stubs.reduce<PaystubTotals>(
-      (accumulator, current) => {
-        accumulator.paid += this.parseMicroDollar(current.paid);
-        accumulator.held += this.parseMicroDollar(current.held);
-        accumulator.distributed += this.parseMicroDollar(current.distributed ?? current.returned);
-        return accumulator;
-      },
-      { paid: 0, held: 0, distributed: 0 },
-    );
-
-    return totals;
+    const stubs = await getNodeArray(`${baseUrl}/api/heldamount/paystubs/${start}/${end}`, {
+      nullAsEmpty: true,
+    });
+    return sumPaystubs(stubs);
   }
 
-  private async fetchNodeStats(host: string): Promise<any> {
-    const url = `http://${host}/api/sno/`;
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(`Node stats request failed with status ${response.status}`);
-    }
-
-    return response.json();
+  private async fetchNodeStats(baseUrl: string): Promise<any> {
+    return getNodeObject(`${baseUrl}/api/sno/`);
   }
 
   private extractDiskUsage(payload: {
@@ -199,13 +157,13 @@ export class StorjService {
   }): StorjDiskUsage {
     const diskSpace = payload?.diskSpace;
     if (!diskSpace) {
-      throw new Error('Response missing diskSpace information.');
+      invalidResponse('Response missing diskSpace information');
     }
 
-    const used = Number(diskSpace.used ?? 0);
-    const available = Number(diskSpace.available ?? 0);
-    const allocated = Number(diskSpace.allocated ?? 0);
-    const trash = Number(diskSpace.trash ?? 0);
+    const used = toNumberOrUndefined(diskSpace.used) ?? 0;
+    const available = toNumberOrUndefined(diskSpace.available) ?? 0;
+    const allocated = toNumberOrUndefined(diskSpace.allocated) ?? 0;
+    const trash = toNumberOrUndefined(diskSpace.trash) ?? 0;
     const capacity = allocated > 0 ? allocated : Math.max(available + used + trash, 0);
     const free = allocated > 0 ? Math.max(available, 0) : Math.max(capacity - (used + trash), 0);
 
@@ -447,36 +405,6 @@ export class StorjService {
       .sort((a, b) => a.timestamp - b.timestamp);
   }
 
-  private computeBandwidthDailySummary(
-    entries: BandwidthDailyEntry[],
-  ): StorjBandwidthStats | undefined {
-    if (entries.length === 0) {
-      return undefined;
-    }
-
-    const latest = entries[entries.length - 1];
-    const previous = entries.length > 1 ? entries[entries.length - 2] : undefined;
-    const sampleHours = previous
-      ? Math.max(Number(((latest.timestamp - previous.timestamp) / MS_PER_HOUR).toFixed(1)), 0)
-      : undefined;
-
-    return {
-      totalBytes: latest.totalBytes,
-      ingressBytes: latest.ingressBytes,
-      egressBytes: latest.egressBytes,
-      repairIngressBytes: latest.repairIngressBytes,
-      repairEgressBytes: latest.repairEgressBytes,
-      repairBytes: latest.repairBytes,
-      auditBytes: latest.auditBytes,
-      changeTotalBytes: previous ? latest.totalBytes - previous.totalBytes : undefined,
-      changeIngressBytes: previous ? latest.ingressBytes - previous.ingressBytes : undefined,
-      changeEgressBytes: previous ? latest.egressBytes - previous.egressBytes : undefined,
-      changeRepairBytes: previous ? latest.repairBytes - previous.repairBytes : undefined,
-      changeAuditBytes: previous ? latest.auditBytes - previous.auditBytes : undefined,
-      changeSampleHours: sampleHours,
-    };
-  }
-
   private computeSatelliteStorageAverages(entries: StorageDailyEntry[]): {
     satelliteDailyAverageBytes?: number;
     satelliteDayChangeBytes?: number;
@@ -490,7 +418,7 @@ export class StorjService {
 
     const latest = entries[entries.length - 1];
     const previous = entries.length > 1 ? entries[entries.length - 2] : undefined;
-    const now = new Date();
+    const now = this.now();
     const monthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0);
     const nextMonthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0);
     const monthEntries = entries.filter(
@@ -586,24 +514,18 @@ export class StorjService {
     };
   }
 
-  private async fetchSatelliteSnapshot(host: string): Promise<{
+  private async fetchSatelliteSnapshot(baseUrl: string): Promise<{
     storageDaily: StorageDailyEntry[];
     bandwidthDaily?: StorjBandwidthStats;
     bandwidthMonth?: StorjBandwidthMonthly;
     audits: StorjAuditScore[];
     auditSummary?: StorjAuditSummary;
   }> {
-    const url = `http://${host}/api/sno/satellites`;
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(`Satellite stats request failed with status ${response.status}`);
-    }
-
-    const payload = await response.json();
+    const payload = await getNodeObject(`${baseUrl}/api/sno/satellites`);
     const storageDaily = this.parseStorageDailyEntries(payload);
-    const bandwidthDaily = this.computeBandwidthDailySummary(
+    const bandwidthDaily = computeBandwidthDailySummary(
       this.parseBandwidthDailyEntries(payload),
+      this.now().getTime(),
     );
     const bandwidthMonth = this.parseBandwidthMonth(payload);
     const audits = this.parseAuditEntries(payload);
@@ -620,52 +542,29 @@ export class StorjService {
     const nodes = await Promise.all(
       this.configuredNodes.map(async (nodeConfig): Promise<StorjNodeStatus> => {
         const host = nodeConfig.host;
-        const url = `http://${host}/api/sno/estimated-payout`;
+        let baseUrl: string | undefined;
 
         try {
-          const response = await fetch(url);
+          baseUrl = nodeBaseUrl(host);
+          const payload = await getNodeObject(`${baseUrl}/api/sno/estimated-payout`);
+          const isObject = (value: unknown): value is Record<string, unknown> =>
+            Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
-          if (!response.ok) {
-            throw new Error(`Request failed with status ${response.status}`);
-          }
-
-          const payload = (await response.json()) as Record<string, any>;
-
-          const current = payload.currentMonth as
-            | {
-                egressBandwidthPayout?: number;
-                egressRepairAuditPayout?: number;
-                diskSpacePayout?: number;
-                held?: number;
-                payout?: number;
-              }
-            | undefined;
-          const lifetimeEntry =
-            (payload.lifetimePayout as Record<string, any> | undefined) ??
-            (payload.lifetime as Record<string, any> | undefined) ??
-            (payload.allTime as Record<string, any> | undefined) ??
-            (payload.cumulative as Record<string, any> | undefined);
-          const previousEntry = payload.previousMonth as
-            | {
-                egressBandwidthPayout?: number;
-                egressRepairAuditPayout?: number;
-                diskSpacePayout?: number;
-                held?: number;
-                payout?: number;
-              }
-            | undefined;
-
-          if (!current) {
-            throw new Error('Response missing currentMonth data.');
+          const current = payload.currentMonth;
+          const previousEntry = payload.previousMonth;
+          if (!isObject(current)) {
+            invalidResponse('Response missing currentMonth data');
           }
 
           const currentSnapshot = this.computeSnapshot(current);
-          const lifetimeSnapshot = lifetimeEntry ? this.computeSnapshot(lifetimeEntry) : undefined;
-          const previousSnapshot = previousEntry ? this.computeSnapshot(previousEntry) : undefined;
+          const previousSnapshot = isObject(previousEntry)
+            ? this.computeSnapshot(previousEntry)
+            : undefined;
 
+          // A failed paystub request leaves the lifetime total partial instead of failing the node.
           let paystubTotals: PaystubTotals | undefined;
           try {
-            paystubTotals = await this.fetchPaystubTotals(host);
+            paystubTotals = await this.fetchPaystubTotals(baseUrl);
           } catch {
             paystubTotals = undefined;
           }
@@ -677,14 +576,14 @@ export class StorjService {
           let auditSummary: StorjAuditSummary | undefined;
           let quicStatus: StorjQuicStatus | undefined;
           try {
-            const nodeStats = await this.fetchNodeStats(host);
+            const nodeStats = await this.fetchNodeStats(baseUrl);
             const snapshot = this.extractDiskUsage(nodeStats);
             bandwidth = this.extractBandwidthStats(nodeStats);
             diskUsage = snapshot;
             quicStatus = this.extractQuicStatus(nodeStats);
 
             try {
-              const satelliteSnapshot = await this.fetchSatelliteSnapshot(host);
+              const satelliteSnapshot = await this.fetchSatelliteSnapshot(baseUrl);
               if (satelliteSnapshot.storageDaily.length > 0) {
                 const storageAverages = this.computeSatelliteStorageAverages(
                   satelliteSnapshot.storageDaily,
@@ -704,45 +603,16 @@ export class StorjService {
             bandwidth = undefined;
           }
 
-          const totalSnapshot = (() => {
-            if (paystubTotals) {
-              return {
-                grossUsd: paystubTotals.paid + paystubTotals.distributed,
-                heldUsd: paystubTotals.held,
-                netUsd: paystubTotals.paid,
-                distributedUsd: paystubTotals.distributed,
-              };
-            }
-
-            if (!lifetimeSnapshot) {
-              if (!previousSnapshot) {
-                return currentSnapshot;
-              }
-
-              return {
-                grossUsd: previousSnapshot.grossUsd + currentSnapshot.grossUsd,
-                heldUsd: previousSnapshot.heldUsd + currentSnapshot.heldUsd,
-                netUsd: previousSnapshot.netUsd + currentSnapshot.netUsd,
-              };
-            }
-
-            const includesCurrent =
-              lifetimeSnapshot.netUsd >= currentSnapshot.netUsd &&
-              lifetimeSnapshot.grossUsd >= currentSnapshot.grossUsd;
-
-            if (includesCurrent) {
-              return lifetimeSnapshot;
-            }
-
-            return {
-              grossUsd: lifetimeSnapshot.grossUsd + currentSnapshot.grossUsd,
-              heldUsd: lifetimeSnapshot.heldUsd + currentSnapshot.heldUsd,
-              netUsd: lifetimeSnapshot.netUsd + currentSnapshot.netUsd,
-            };
-          })();
+          const totalSnapshot = computeLifetimeSnapshot({
+            current: currentSnapshot,
+            previous: previousSnapshot,
+            paystubs: paystubTotals,
+            now: this.now(),
+          });
 
           return {
-            host,
+            host: displayNodeHost(host),
+            baseUrl,
             status: 'ok',
             current: currentSnapshot,
             total: totalSnapshot,
@@ -754,12 +624,11 @@ export class StorjService {
             quicStatus,
           };
         } catch (error) {
-          const message = error instanceof Error ? error.message : 'Unknown error';
-
           return {
-            host,
+            host: displayNodeHost(host),
+            baseUrl,
             status: 'error',
-            message,
+            ...toNodeFailure(error),
           };
         }
       }),
@@ -803,6 +672,7 @@ export class StorjService {
               heldUsd: accumulator.total.heldUsd + current.total.heldUsd,
               distributedUsd:
                 (accumulator.total.distributedUsd ?? 0) + (current.total.distributedUsd ?? 0),
+              isPartial: Boolean(accumulator.total.isPartial || current.total.isPartial),
             },
             disk: {
               usedBytes: accumulator.disk.usedBytes + (current.disk?.usedBytes ?? 0),
@@ -899,6 +769,8 @@ export class StorjService {
                 accumulator.bandwidth?.changeSampleHours,
                 current.bandwidth?.changeSampleHours,
               ),
+              changeDayStart:
+                accumulator.bandwidth?.changeDayStart ?? current.bandwidth?.changeDayStart,
             },
             bandwidthMonth: {
               totalBytes: addOptional(
@@ -917,11 +789,12 @@ export class StorjService {
           };
         }
 
-        return accumulator;
+        // A failed node adds nothing, so the lifetime sum is not the whole network's.
+        return { ...accumulator, total: { ...accumulator.total, isPartial: true } };
       },
       {
         current: { grossUsd: 0, netUsd: 0, heldUsd: 0, distributedUsd: 0 },
-        total: { grossUsd: 0, netUsd: 0, heldUsd: 0, distributedUsd: 0 },
+        total: { grossUsd: 0, netUsd: 0, heldUsd: 0, distributedUsd: 0, isPartial: false },
         disk: {
           usedBytes: 0,
           availableBytes: 0,
@@ -949,12 +822,14 @@ export class StorjService {
   }
 
   private getMockStorjSummary(options?: { range?: StorjSummaryRange }): StorjSummary {
+    // The change compares the last complete UTC day (yesterday) with the day before it.
+    const changeDayStart = formatIsoUtc(utcDayStart(this.now().getTime()) - 24 * MS_PER_HOUR);
     const mockNodes: StorjNodeStatus[] = [
       {
         host: 'demo-storj-1.example.com:14002',
         status: 'ok',
         current: { grossUsd: 150, heldUsd: 10, netUsd: 140 },
-        total: { grossUsd: 300, heldUsd: 20, netUsd: 280 },
+        total: { grossUsd: 300, heldUsd: 20, netUsd: 280, distributedUsd: 265, isPartial: false },
         disk: {
           usedBytes: 1073741824, // 1 GB
           availableBytes: 2147483648, // 2 GB
@@ -965,6 +840,11 @@ export class StorjService {
           totalBytes: 536870912, // 512 MB
           ingressBytes: 268435456,
           egressBytes: 268435456,
+          changeTotalBytes: 67108864, // +64 MB
+          changeIngressBytes: 50331648,
+          changeEgressBytes: 16777216,
+          changeSampleHours: 24,
+          changeDayStart,
         },
         audits: [
           { satelliteName: 'us-central-1', auditScore: 1.0, suspensionScore: 1.0, onlineScore: 1.0 },
@@ -976,7 +856,7 @@ export class StorjService {
         host: 'demo-storj-2.example.com:14003',
         status: 'ok',
         current: { grossUsd: 120, heldUsd: 8, netUsd: 112 },
-        total: { grossUsd: 250, heldUsd: 15, netUsd: 235 },
+        total: { grossUsd: 250, heldUsd: 15, netUsd: 235, distributedUsd: 220, isPartial: false },
         disk: {
           usedBytes: 536870912, // 512 MB
           availableBytes: 1073741824, // 1 GB
@@ -987,6 +867,11 @@ export class StorjService {
           totalBytes: 268435456, // 256 MB
           ingressBytes: 134217728,
           egressBytes: 134217728,
+          changeTotalBytes: -33554432, // -32 MB
+          changeIngressBytes: -16777216,
+          changeEgressBytes: -16777216,
+          changeSampleHours: 24,
+          changeDayStart,
         },
         audits: [
           { satelliteName: 'eu-west-1', auditScore: 0.99, suspensionScore: 1.0, onlineScore: 0.98 },
@@ -998,12 +883,15 @@ export class StorjService {
         host: 'demo-storj-3.example.com:14004',
         status: 'error',
         message: 'Connection refused',
+        errorKind: 'unreachable',
+        health: 'offline',
       },
     ];
 
     const aggregate = {
       current: { grossUsd: 270, netUsd: 252, heldUsd: 18, distributedUsd: 0 },
-      total: { grossUsd: 550, netUsd: 515, heldUsd: 35, distributedUsd: 0 },
+      // demo-storj-3 is offline and left out of the sums, as a failed live node is.
+      total: { grossUsd: 550, netUsd: 515, heldUsd: 35, distributedUsd: 485, isPartial: true },
       disk: {
         usedBytes: 1610612736, // 1.5 GB
         availableBytes: 3221225472, // 3 GB
@@ -1014,6 +902,11 @@ export class StorjService {
         totalBytes: 805306368, // 768 MB
         ingressBytes: 402653184,
         egressBytes: 402653184,
+        changeTotalBytes: 33554432, // +32 MB
+        changeIngressBytes: 33554432,
+        changeEgressBytes: 0,
+        changeSampleHours: 24,
+        changeDayStart,
       },
       bandwidthMonth: {
         totalBytes: 1073741824, // 1 GB
@@ -1023,7 +916,7 @@ export class StorjService {
     };
 
     return {
-      nodes: mockNodes,
+      nodes: mockNodes.map((node) => ({ ...node, baseUrl: nodeBaseUrl(node.host) })),
       aggregate,
     };
   }

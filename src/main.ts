@@ -1,15 +1,23 @@
 import 'dotenv/config';
 import 'reflect-metadata';
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import { loadHttpsOptions } from './https-options';
 
 async function bootstrap() {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  const httpsOptions = loadHttpsOptions();
+  const app = await NestFactory.create<NestExpressApplication>(
+    AppModule,
+    httpsOptions ? { httpsOptions } : {},
+  );
   app.enableCors({
     origin: '*',
   });
-  await app.listen(process.env.PORT || 3000);
+  const port = process.env.PORT || 3000;
+  await app.listen(port);
+  Logger.log(`Dashboard on ${httpsOptions ? 'https' : 'http'} port ${port}`, 'Bootstrap');
 }
 
 bootstrap().catch((error) => {

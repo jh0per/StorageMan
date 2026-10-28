@@ -242,11 +242,43 @@ function formatScore(score) {
   return `${(score * 100).toFixed(2)}%`;
 }
 
-function getNodeStatusMeta(status, message) {
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * The node's host, linked to its dashboard. The server sends `baseUrl` for every address it can
+ * read; without it (an invalid address) the host is plain text instead of a guessed link such as
+ * `http://https://host`.
+ */
+function renderNodeHostLink(node) {
+  const host = escapeHtml(node?.host ?? '');
+  if (typeof node?.baseUrl !== 'string' || !/^https?:\/\//.test(node.baseUrl)) {
+    return host;
+  }
+  return `<a href="${escapeHtml(node.baseUrl)}" target="_blank" rel="noreferrer noopener">${host}</a>`;
+}
+
+function getNodeStatusMeta(status, message, health) {
   if (status !== 'error') {
     return {
       label: 'Online',
       className: 'status-pill--online',
+    };
+  }
+
+  // The server classifies failures by error code and HTTP status (`health`); message matching
+  // is only a fallback for responses without it.
+  if (health === 'offline' || health === 'misconfigured') {
+    const isOfflineHealth = health === 'offline';
+    return {
+      label: isOfflineHealth ? 'Offline' : 'Misconfigured',
+      className: isOfflineHealth ? 'status-pill--offline' : 'status-pill--misconfigured',
     };
   }
 
@@ -277,8 +309,8 @@ function getNodeStatusMeta(status, message) {
   };
 }
 
-function renderStatusBadge(status, message) {
-  const meta = getNodeStatusMeta(status, message);
+function renderStatusBadge(status, message, health) {
+  const meta = getNodeStatusMeta(status, message, health);
   if (!meta) {
     return '';
   }
@@ -351,7 +383,7 @@ function collectOverviewProblems(system, data) {
 
   return data.nodes.flatMap((node) => {
     if (node.status === 'error') {
-      const meta = getNodeStatusMeta(node.status, node.message);
+      const meta = getNodeStatusMeta(node.status, node.message, node.health);
       return [
         {
           type: meta.label.toLowerCase(),
@@ -733,14 +765,26 @@ function getStorjBandwidthTrendMetrics(bandwidth) {
   ].filter(Boolean);
 }
 
-function getStorjBandwidthTrendLabel(bandwidth) {
-  if (!Number.isFinite(bandwidth?.changeSampleHours) || bandwidth.changeSampleHours <= 0) {
-    return 'Trend';
+/**
+ * Label of the bandwidth change row. The change is the last complete UTC day against the day
+ * before it (`changeDayStart`), not today, so the label names that day; the tooltip says so.
+ */
+function renderStorjBandwidthTrendLabel(bandwidth) {
+  const dayStart = bandwidth?.changeDayStart ? new Date(bandwidth.changeDayStart) : null;
+  if (dayStart && Number.isFinite(dayStart.getTime())) {
+    const format = (date) =>
+      date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    const dayBefore = new Date(dayStart.getTime() - 24 * 60 * 60 * 1000);
+    const title = `Change of ${format(dayStart)} (last complete UTC day) against ${format(dayBefore)}`;
+    return `<span class="inline-metrics-row__label" title="${escapeHtml(title)}">${escapeHtml(format(dayStart))} Δ</span>`;
   }
 
-  const hours = bandwidth.changeSampleHours;
-  const label = Number.isInteger(hours) ? String(hours) : hours.toFixed(1).replace(/\.0$/, '');
-  return `${label}HΔ`;
+  let label = 'Trend';
+  if (Number.isFinite(bandwidth?.changeSampleHours) && bandwidth.changeSampleHours > 0) {
+    const hours = bandwidth.changeSampleHours;
+    label = `${Number.isInteger(hours) ? String(hours) : hours.toFixed(1).replace(/\.0$/, '')}HΔ`;
+  }
+  return `<span class="inline-metrics-row__label">${label}</span>`;
 }
 
 function getMetricToneClass(value) {
@@ -1055,7 +1099,12 @@ function renderStorjTotals(target, data) {
   const revenueMarkup = `
     <div class="totals-card__section totals-card__wallet totals-card__summary">
       <div class="heading-title">Revenue (USD)</div>
-      ${renderStorjRevenueSummary(aggregateCurrent, aggregateTotal, 'storj-summary-stack--totals')}
+      ${renderStorjRevenueSummary(
+        aggregateCurrent,
+        aggregateTotal,
+        'storj-summary-stack--totals',
+        'Not every node is counted in full: a node failed, or its payout history is incomplete',
+      )}
     </div>
   `;
 
@@ -1111,7 +1160,7 @@ function renderStorjTotals(target, data) {
                 aggregateBandwidthTrendMetrics.length > 0
                   ? `
                     <div class="inline-metrics-row storj-summary-row">
-                      <span class="inline-metrics-row__label">${getStorjBandwidthTrendLabel(aggregate.bandwidth)}</span>
+                      ${renderStorjBandwidthTrendLabel(aggregate.bandwidth)}
                       ${renderSummaryMetricLine(
                         aggregateBandwidthTrendMetrics,
                         'summary-metrics--node-wallet',
@@ -1250,7 +1299,12 @@ function renderContractSummary(summary, extraClass = '') {
   );
 }
 
-function renderStorjRevenueSummary(currentSnapshot, totalSnapshot, extraClass = '') {
+function renderStorjRevenueSummary(
+  currentSnapshot,
+  totalSnapshot,
+  extraClass = '',
+  partialTitle = "Payout history incomplete: unavailable, or a month's paystubs are not out yet",
+) {
   const classes = ['inline-metrics-stack', 'storj-summary-stack'];
   if (extraClass) {
     classes.push(extraClass);
@@ -1270,12 +1324,22 @@ function renderStorjRevenueSummary(currentSnapshot, totalSnapshot, extraClass = 
         )}
       </div>
       <div class="inline-metrics-row storj-summary-row">
-        <span class="inline-metrics-row__label">Lifetime</span>
+        ${
+          totalSnapshot.isPartial
+            ? `<span class="inline-metrics-row__label" title="${escapeHtml(partialTitle)}">Lifetime (partial)</span>`
+            : '<span class="inline-metrics-row__label">Lifetime</span>'
+        }
         ${renderSummaryMetricLine(
           [
             { label: 'Gross', value: formatUsd(totalSnapshot.grossUsd ?? 0) },
             { label: 'Held', value: formatUsd(totalSnapshot.heldUsd ?? 0) },
             { label: 'Net', value: formatUsd(totalSnapshot.netUsd ?? 0), className: 'value-net' },
+            // Actually transferred; reported apart, never part of the sums. A node without its
+            // payout history has no figure (0 from the server), so it is left out.
+            ...(Number.isFinite(totalSnapshot.distributedUsd) &&
+            !(totalSnapshot.isPartial && totalSnapshot.distributedUsd === 0)
+              ? [{ label: 'Distributed', value: formatUsd(totalSnapshot.distributedUsd) }]
+              : []),
           ],
           'summary-metrics--node-wallet',
         )}
@@ -1299,7 +1363,7 @@ function renderSiaAnnounceButton(host) {
 }
 
 function renderSiaNodeCard(node, index, currentLabel = 'Current') {
-  const link = `<a href="http://${node.host}" target="_blank" rel="noreferrer noopener">${node.host}</a>`;
+  const link = renderNodeHostLink(node);
   const showCurrentMonthMetric =
     node.totals?.currentMonth && !isCurrentMonthMetricLabel(currentLabel);
   const sections = [
@@ -1318,6 +1382,7 @@ function renderSiaNodeCard(node, index, currentLabel = 'Current') {
           node.quicStatus,
           [],
           renderSiaAnnounceButton(node.host),
+          node.health,
         )}
       </div>
     `,
@@ -1326,7 +1391,7 @@ function renderSiaNodeCard(node, index, currentLabel = 'Current') {
   if (node.status === 'error') {
     sections.push(`
       <div class="totals-card__section sia-node-card__message">
-        <div class="wallet-card__message">⚠️ ${node.message}</div>
+        <div class="wallet-card__message">⚠️ ${escapeHtml(node.message)}</div>
       </div>
     `);
 
@@ -1472,7 +1537,7 @@ function renderSiaNodeCard(node, index, currentLabel = 'Current') {
 }
 
 function renderStorjNodeCard(node, index) {
-  const link = `<a href="http://${node.host}" target="_blank" rel="noreferrer noopener">${node.host}</a>`;
+  const link = renderNodeHostLink(node);
   const storageEntries = getStorjStorageSummaryEntries(node.disk);
   const sections = [
     `
@@ -1489,6 +1554,8 @@ function renderStorjNodeCard(node, index) {
           node.status === 'error' ? node.message : '',
           node.quicStatus,
           storageEntries,
+          '',
+          node.health,
         )}
       </div>
     `,
@@ -1497,7 +1564,7 @@ function renderStorjNodeCard(node, index) {
   if (node.status === 'error') {
     sections.push(`
       <div class="totals-card__section storj-node-card__message">
-        <div class="wallet-card__message">⚠️ ${node.message}</div>
+        <div class="wallet-card__message">⚠️ ${escapeHtml(node.message)}</div>
       </div>
     `);
 
@@ -1602,7 +1669,7 @@ function renderStorjNodeCard(node, index) {
             trendMetrics.length > 0
               ? `
                 <div class="inline-metrics-row storj-summary-row">
-                  <span class="inline-metrics-row__label">${getStorjBandwidthTrendLabel(node.bandwidth)}</span>
+                  ${renderStorjBandwidthTrendLabel(node.bandwidth)}
                   ${renderSummaryMetricLine(trendMetrics, 'summary-metrics--node-wallet')}
                 </div>
               `
@@ -1712,7 +1779,13 @@ function renderStorjNodes(data) {
   });
 }
 
+// Each load gets a number; a response that arrives after a newer load started (e.g. 1Y then 1D
+// picked quickly) is dropped instead of overwriting the newer figures.
+let siaLoadGeneration = 0;
+let storjLoadGeneration = 0;
+
 async function loadSia() {
+  const generation = ++siaLoadGeneration;
   overviewSiaPeriod.textContent = '';
   setPlaceholder(siaBody, 'Loading…');
   siaPeriod.textContent = '';
@@ -1723,6 +1796,9 @@ async function loadSia() {
       throw new Error(`Request failed with status ${response.status}`);
     }
     const data = await response.json();
+    if (generation !== siaLoadGeneration) {
+      return false;
+    }
     latestSiaOverviewData = data;
     latestSiaOverviewError = undefined;
     renderSiaOverview(data);
@@ -1730,6 +1806,9 @@ async function loadSia() {
     renderOverviewProblems();
     return true;
   } catch (error) {
+    if (generation !== siaLoadGeneration) {
+      return false;
+    }
     latestSiaOverviewData = undefined;
     latestSiaOverviewError = error.message;
     overviewSiaPeriod.textContent = `⚠️ ${error.message}`;
@@ -1742,14 +1821,18 @@ async function loadSia() {
 }
 
 async function loadStorj() {
+  const generation = ++storjLoadGeneration;
   setPlaceholder(storjBody, 'Loading…');
   try {
-    const url = buildOverviewApiUrl('/api/storj');
-    const response = await fetch(url, { cache: 'no-store' });
+    // The Storj node API has no range: every range shows the same node figures.
+    const response = await fetch('/api/storj', { cache: 'no-store' });
     if (!response.ok) {
       throw new Error(`Request failed with status ${response.status}`);
     }
     const data = await response.json();
+    if (generation !== storjLoadGeneration) {
+      return false;
+    }
     latestStorjOverviewData = data;
     latestStorjOverviewError = undefined;
     renderStorjOverview(data);
@@ -1757,6 +1840,9 @@ async function loadStorj() {
     renderOverviewProblems();
     return true;
   } catch (error) {
+    if (generation !== storjLoadGeneration) {
+      return false;
+    }
     latestStorjOverviewData = undefined;
     latestStorjOverviewError = error.message;
     renderStorjTotals(overviewStorjTotals);
@@ -1886,7 +1972,8 @@ document.addEventListener('click', (event) => {
     overviewRangeKey = resolved.key;
     localStorage.setItem(OVERVIEW_RANGE_STORAGE_KEY, overviewRangeKey);
     updateOverviewRangePickers();
-    loadAll().catch((error) => {
+    // Only Sia figures depend on the range; Storj is refreshed by the refresh button.
+    loadSia().catch((error) => {
       // eslint-disable-next-line no-console
       console.error('Unable to reload data', error);
     });
@@ -1945,6 +2032,7 @@ function renderNodeHeading(
   quicStatus,
   extraStorageEntries = [],
   actionMarkup = '',
+  statusHealth,
 ) {
   const title = `${label.toUpperCase()}${typeof index === 'number' ? ` #${index}` : ''}: ${link}`;
   const usedRaw = Number(usedBytes);
@@ -1952,7 +2040,10 @@ function renderNodeHeading(
   const numericUsed = Number.isFinite(usedRaw) ? Math.max(usedRaw, 0) : 0;
   const numericTotal = Number.isFinite(totalRaw) ? Math.max(totalRaw, 0) : NaN;
   const hasStorage = Number.isFinite(numericTotal) && numericTotal > 0;
-  const badges = [renderStatusBadge(status, statusMessage), renderQuicBadge(quicStatus)]
+  const badges = [
+    renderStatusBadge(status, statusMessage, statusHealth),
+    renderQuicBadge(quicStatus),
+  ]
     .filter(Boolean)
     .join('');
   const adornments = [actionMarkup, badges ? `<span class="heading-title__badges-list">${badges}</span>` : '']

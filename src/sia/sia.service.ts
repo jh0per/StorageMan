@@ -1,5 +1,19 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { Buffer } from 'buffer';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { displayNodeHost, nodeBaseUrl } from '../common/node-endpoint';
+import {
+  hastingsToSiacoins,
+  hastingsToSiacoinsOrUndefined,
+  toNumberOrUndefined,
+} from '../common/node-numbers';
+import {
+  basicAuthorization,
+  getNodeArray,
+  getNodeObject,
+  invalidResponse,
+  NodeRequestError,
+  requestNodeText,
+  toNodeFailure,
+} from '../common/node-request';
 import { getRuntimeEnv } from '../runtime-env';
 import {
   SiaContractSummary,
@@ -13,13 +27,103 @@ import {
 
 const RELEVANT_METRICS = new Set(['rpc', 'storage', 'ingress', 'egress']);
 const SECTOR_SIZE_BYTES = 4 * 1024 * 1024;
-const MS_PER_HOUR = 60 * 60 * 1000;
+const MS_PER_MINUTE = 60 * 1000;
+const MS_PER_HOUR = 60 * MS_PER_MINUTE;
 const MS_PER_DAY = 24 * MS_PER_HOUR;
 const ROLLING_WINDOW_DAYS = 30;
 const ROLLING_WINDOW_BUFFER_DAYS = 2;
 
 type HostdMetricPeriod = '5m' | '15m' | 'hourly' | 'daily' | 'weekly' | 'monthly' | 'yearly';
 type SiaSummaryRange = '1d' | '7d' | '1m' | '3m' | '1y' | 'all';
+
+/** Which totals a current month may count from, best first (see `currentMonthInRange`). */
+type MonthBaseline = 'atMonthStart' | 'beforeMonthStart' | 'earliest';
+const MONTH_BASELINES: MonthBaseline[] = ['atMonthStart', 'beforeMonthStart', 'earliest'];
+
+/** Stored bytes and when they were current. */
+interface StoragePoint {
+  asOfMs: number;
+  usedBytes: number;
+}
+
+/**
+ * When the totals of the hostd metrics entry stamped `timestampMs` were current. hostd stamps each
+ * `/api/metrics/:period` entry with the start of its period and fills it with the last totals
+ * recorded in that period (`PeriodMetrics` in hostd's persist/sqlite/metrics.go), so an entry
+ * holds the totals as of the end of its period, or as of `nowMs` for the period still running: the
+ * daily entry stamped on the 1st holds them at the end of the 1st, and the totals at the 1st's
+ * midnight are in the entry of the day before. Every baseline and every storage sample is placed
+ * at this time, not at the stamp.
+ */
+function metricEntryAsOfMs(timestampMs: number, period: HostdMetricPeriod, nowMs: number): number {
+  return Math.max(timestampMs, Math.min(metricPeriodEndMs(timestampMs, period), nowMs));
+}
+
+/**
+ * The `periods` to ask for from `startMs`: how many periods begin before `endMs`, the first one at
+ * `startMs` normalised like hostd's `metrics.Normalize` does with a `Z` start (in UTC, weeks from
+ * Sunday). Without it hostd counts up to its own local date (handleGETPeriodMetrics), so on a
+ * server west of UTC the daily series lacks the UTC day that has begun, east of UTC it holds
+ * tomorrow's entry after the server's midnight, and from Thursday to Saturday the weekly series
+ * ends with next Sunday's.
+ */
+function metricPeriodCount(startMs: number, endMs: number, period: HostdMetricPeriod): number {
+  let count = 0;
+  for (
+    let periodStartMs = metricPeriodStartMs(startMs, period);
+    periodStartMs < endMs;
+    periodStartMs = metricPeriodEndMs(periodStartMs, period)
+  ) {
+    count += 1;
+  }
+  return Math.max(count, 1);
+}
+
+/** The start of the period `instantMs` falls in, in UTC. */
+function metricPeriodStartMs(instantMs: number, period: HostdMetricPeriod): number {
+  const date = new Date(instantMs);
+  const [year, month, day] = [date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()];
+  switch (period) {
+    case '5m':
+      return instantMs - (instantMs % (5 * MS_PER_MINUTE));
+    case '15m':
+      return instantMs - (instantMs % (15 * MS_PER_MINUTE));
+    case 'hourly':
+      return instantMs - (instantMs % MS_PER_HOUR);
+    case 'daily':
+      return Date.UTC(year, month, day);
+    case 'weekly':
+      return Date.UTC(year, month, day - date.getUTCDay());
+    case 'monthly':
+      return Date.UTC(year, month, 1);
+    case 'yearly':
+      return Date.UTC(year, 0, 1);
+  }
+}
+
+/**
+ * The end of the period that starts at `startMs`. A `Z` start is normalised in UTC, and hostd's
+ * months and years start at midnight on the 1st.
+ */
+function metricPeriodEndMs(startMs: number, period: HostdMetricPeriod): number {
+  const start = new Date(startMs);
+  switch (period) {
+    case '5m':
+      return startMs + 5 * MS_PER_MINUTE;
+    case '15m':
+      return startMs + 15 * MS_PER_MINUTE;
+    case 'hourly':
+      return startMs + MS_PER_HOUR;
+    case 'daily':
+      return startMs + MS_PER_DAY;
+    case 'weekly':
+      return startMs + 7 * MS_PER_DAY;
+    case 'monthly':
+      return Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, start.getUTCDate());
+    case 'yearly':
+      return Date.UTC(start.getUTCFullYear() + 1, start.getUTCMonth(), start.getUTCDate());
+  }
+}
 
 interface SiaSummaryRequestConfig {
   mode: 'calendar' | 'range';
@@ -76,6 +180,10 @@ interface SiaNodeConfig {
 
 @Injectable()
 export class SiaService {
+  private readonly logger = new Logger(SiaService.name);
+  /** `host` + `walletHost` pairs whose unusable walletHost was logged, so each is logged once. */
+  private readonly reportedWalletHosts = new Set<string>();
+
   private get sharedHosts(): string[] {
     const raw = getRuntimeEnv('SIA_HOSTS');
     if (!raw) {
@@ -161,15 +269,7 @@ export class SiaService {
   }
 
   private buildAuthorizationHeader(username?: string, password?: string): string | undefined {
-    const resolvedUsername = username ?? '';
-    const resolvedPassword = password ?? '';
-    const hasCredentials = resolvedUsername !== '' || resolvedPassword !== '';
-    if (!hasCredentials) {
-      return undefined;
-    }
-
-    const token = Buffer.from(`${resolvedUsername}:${resolvedPassword}`).toString('base64');
-    return `Basic ${token}`;
+    return basicAuthorization(username, password);
   }
 
   private getConfiguredNode(host: string): SiaNodeConfig {
@@ -183,17 +283,7 @@ export class SiaService {
   }
 
   private hastingsToSiacoins(hastings?: number | string): number {
-    if (hastings === undefined || hastings === null) {
-      return 0;
-    }
-
-    const numeric = typeof hastings === 'string' ? Number(hastings) : hastings;
-
-    if (!numeric) {
-      return 0;
-    }
-
-    return numeric / 10 ** 24;
+    return hastingsToSiacoins(hastings);
   }
 
   private getPeriodStart(): string {
@@ -365,6 +455,8 @@ export class SiaService {
 
     const periodEndMs = Date.parse(periodEnd);
     const referenceMs = options?.month ? periodEndMs : Date.now();
+    // Only the month running now is "Current"; any other ?month= is named, e.g. "September 2026".
+    const isCurrentMonth = periodStart === this.getPeriodStart();
 
     return {
       mode: 'calendar',
@@ -383,9 +475,14 @@ export class SiaService {
         : this.getIsoHoursAgo(30),
       metricPeriod: 'monthly',
       metricStart: this.getPreviousPeriodStart(periodStart),
-      periodLabel: 'Current month',
-      periodShortLabel: 'Current',
+      periodLabel: isCurrentMonth ? 'Current month' : this.formatUtcMonth(periodStart, 'long'),
+      periodShortLabel: isCurrentMonth ? 'Current' : this.formatUtcMonth(periodStart, 'short'),
     };
+  }
+
+  /** `September 2026` (long) or `Sep 2026` (short) for the UTC month of an ISO timestamp. */
+  private formatUtcMonth(iso: string, month: 'long' | 'short'): string {
+    return new Date(iso).toLocaleString('en-US', { month, year: 'numeric', timeZone: 'UTC' });
   }
 
   private getLatestMetricEntry(entries?: HostdMetricEntry[]): HostdMetricEntry | undefined {
@@ -402,9 +499,12 @@ export class SiaService {
     return ordered?.[0]?.timestamp;
   }
 
+  /** The last entry of `period` with totals as of `targetIso` or earlier (see metricEntryAsOfMs). */
   private pickMetricBaselineEntry(
     entries: HostdMetricEntry[] | undefined,
+    period: HostdMetricPeriod,
     targetIso: string,
+    nowMs: number,
   ): HostdMetricEntry | undefined {
     const ordered = this.orderMetricEntries(entries);
     if (!ordered || ordered.length === 0) {
@@ -425,7 +525,7 @@ export class SiaService {
       if (!Number.isFinite(timestamp)) {
         continue;
       }
-      if (timestamp <= targetMs) {
+      if (metricEntryAsOfMs(timestamp, period, nowMs) <= targetMs) {
         baseline = entry;
       } else {
         break;
@@ -435,9 +535,48 @@ export class SiaService {
     return baseline;
   }
 
+  /**
+   * The calendar month's revenue while a range is shown, from the first of `series` with totals as
+   * of the month's first midnight exactly: the daily entry of the previous month's last day or the
+   * previous month's monthly entry (a weekly entry ends there only when the 1st is a Sunday). When
+   * none has them, from the last totals before that midnight (weekly totals alone: up to six days
+   * more); when none reaches back that far, from the earliest totals of the first series that has
+   * two entries and was requested from the month's start or earlier: its history begins within the
+   * month. Undefined when no series tells (the daily and monthly requests failed, and the range's
+   * own series, such as 1d's last 30 hours, begins within the month): those totals would read as
+   * the month's revenue. Each series is [period, entries, the start it was requested from].
+   */
+  private currentMonthInRange(
+    series: Array<[HostdMetricPeriod, HostdMetricEntry[] | undefined, string]>,
+    calendarBaselineStart: string,
+    nowMs: number,
+  ): SiaMetricSnapshot | undefined {
+    for (const match of MONTH_BASELINES) {
+      for (const [period, entries, requestedFrom] of series) {
+        const snapshot = this.buildCurrentMonthMetricSnapshot(
+          entries,
+          period,
+          requestedFrom,
+          calendarBaselineStart,
+          nowMs,
+          match,
+        );
+        if (snapshot) {
+          return snapshot;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /** The revenue since `calendarBaselineStart` in one series, from the baseline `match` allows. */
   private buildCurrentMonthMetricSnapshot(
     entries: HostdMetricEntry[] | undefined,
+    period: HostdMetricPeriod,
+    requestedFrom: string,
     calendarBaselineStart: string,
+    nowMs: number,
+    match: MonthBaseline,
   ): SiaMetricSnapshot | undefined {
     const ordered = this.orderMetricEntries(entries);
     if (!ordered || ordered.length < 2) {
@@ -445,17 +584,30 @@ export class SiaService {
     }
 
     const currentEntry = ordered[ordered.length - 1];
-    const targetMs = Date.parse(calendarBaselineStart);
-    let baselineEntry = this.pickMetricBaselineEntry(ordered, calendarBaselineStart);
-
-    if (!baselineEntry && Number.isFinite(targetMs)) {
-      baselineEntry = ordered.find((entry) => {
-        if (entry === currentEntry || !entry.timestamp) {
-          return false;
-        }
-        const timestamp = Date.parse(entry.timestamp);
-        return Number.isFinite(timestamp) && timestamp >= (targetMs as number);
-      });
+    const lastBeforeMonth = this.pickMetricBaselineEntry(
+      ordered,
+      period,
+      calendarBaselineStart,
+      nowMs,
+    );
+    let baselineEntry: HostdMetricEntry | undefined;
+    switch (match) {
+      case 'atMonthStart': {
+        const timestampMs = Date.parse(lastBeforeMonth?.timestamp ?? '');
+        const atMonthStart =
+          Number.isFinite(timestampMs) &&
+          metricEntryAsOfMs(timestampMs, period, nowMs) === Date.parse(calendarBaselineStart);
+        baselineEntry = atMonthStart ? lastBeforeMonth : undefined;
+        break;
+      }
+      case 'beforeMonthStart':
+        baselineEntry = lastBeforeMonth;
+        break;
+      case 'earliest':
+        baselineEntry =
+          lastBeforeMonth ??
+          (Date.parse(requestedFrom) <= Date.parse(calendarBaselineStart) ? ordered[0] : undefined);
+        break;
     }
 
     if (!baselineEntry || baselineEntry === currentEntry) {
@@ -567,24 +719,10 @@ export class SiaService {
   async announceHost(host: string): Promise<{ host: string; success: true }> {
     const node = this.getConfiguredNode(host);
     const authorization = this.buildAuthorizationHeader(node.username, node.password);
-    const url = `http://${node.host}/api/settings/announce`;
-    const response = await fetch(url, {
+    await requestNodeText(`${nodeBaseUrl(node.host)}/api/settings/announce`, {
       method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        ...(authorization ? { Authorization: authorization } : {}),
-      },
+      authorization,
     });
-
-    const raw = await response.text();
-    if (!response.ok) {
-      throw new Error(
-        `announce request failed for ${url} with status ${response.status} ${response.statusText} ${raw.slice(
-          0,
-          200,
-        )}`,
-      );
-    }
 
     return {
       host: node.host,
@@ -597,10 +735,6 @@ export class SiaService {
       Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 0, 0, 0),
     );
     return this.toIsoString(start);
-  }
-
-  private getLocalTimezoneOffsetMs(): number {
-    return new Date().getTimezoneOffset() * 60 * 1000;
   }
 
   private extractMetricValue(
@@ -644,36 +778,15 @@ export class SiaService {
   }
 
   private async fetchStorageUsage(host: string, authorization?: string): Promise<SiaStorageUsage> {
-    const url = `http://${host}/api/metrics`;
-    const response = await fetch(url, {
-      headers: {
-        Accept: 'application/json',
-        ...(authorization ? { Authorization: authorization } : {}),
-      },
-    });
-
-    const raw = await response.text();
-
-    if (!response.ok) {
-      throw new Error(
-        `Storage metrics request failed for ${url} with status ${response.status} ${response.statusText} ${raw.slice(0, 200)}`,
-      );
+    const payload = await getNodeObject(`${nodeBaseUrl(host)}/api/metrics`, { authorization });
+    const storage = payload.storage;
+    if (!storage || typeof storage !== 'object') {
+      // Not a hostd metrics reply: use the historical snapshot instead of a 0-byte disk.
+      invalidResponse('Storage metrics payload is incomplete');
     }
 
-    const contentType = response.headers.get('content-type') ?? '';
-    if (!contentType.includes('application/json')) {
-      throw new Error(`Storage metrics response is not JSON for ${url}: ${raw.slice(0, 200)}`);
-    }
-
-    const payload = JSON.parse(raw) as {
-      storage?: {
-        totalSectors?: number | string;
-        physicalSectors?: number | string;
-      };
-    };
-
-    const totalSectors = Math.max(Number(payload.storage?.totalSectors ?? 0), 0);
-    const usedSectors = Math.max(Number(payload.storage?.physicalSectors ?? 0), 0);
+    const totalSectors = Math.max(toNumberOrUndefined(storage.totalSectors) ?? 0, 0);
+    const usedSectors = Math.max(toNumberOrUndefined(storage.physicalSectors) ?? 0, 0);
 
     const capacityBytes = totalSectors * SECTOR_SIZE_BYTES;
     const usedBytes = Math.min(usedSectors, totalSectors) * SECTOR_SIZE_BYTES;
@@ -698,9 +811,17 @@ export class SiaService {
       ? baseOverride.endsWith('/')
         ? baseOverride
         : `${baseOverride}/`
-      : `http://${host}/api/`;
+      : `${nodeBaseUrl(host)}/api/`;
 
-    const url = new URL(`metrics/${period}`, baseUrl);
+    let url: URL;
+    try {
+      url = new URL(`metrics/${period}`, baseUrl);
+    } catch (error) {
+      // Only a malformed SIA_METRICS_BASE_URL gets here: a node's base URL always parses.
+      throw new NodeRequestError('invalid_endpoint', 'Invalid SIA_METRICS_BASE_URL', {
+        cause: error,
+      });
+    }
     if (baseOverride && url.hostname.includes('api.sia.tech')) {
       url.searchParams.set('host', host);
     }
@@ -710,46 +831,15 @@ export class SiaService {
     if (end) {
       url.searchParams.set('end', end);
     }
-
-    const response = await fetch(url.toString(), {
-      headers: {
-        Accept: 'application/json',
-        ...(authorization ? { Authorization: authorization } : {}),
-      },
-    });
-
-    const raw = await response.text();
-    if (!response.ok) {
-      throw new Error(
-        `${period} metrics request failed for ${url.toString()} with status ${response.status} ${response.statusText} ${raw.slice(
-          0,
-          200,
-        )}`,
-      );
+    // hostd reads `start` and `periods`, not `end`. A month view ends on the next 1st, which for
+    // the running month is still ahead: periods that have not begun yet are not asked for.
+    const startMs = Date.parse(start ?? '');
+    const endMs = Math.min(Date.parse(end ?? ''), Date.now());
+    if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+      url.searchParams.set('periods', String(metricPeriodCount(startMs, endMs, period)));
     }
 
-    const contentType = response.headers.get('content-type') ?? '';
-    if (!contentType.includes('application/json')) {
-      throw new Error(
-        `${period} metrics response is not JSON from ${url.toString()}: ${raw.slice(0, 200)}`,
-      );
-    }
-
-    try {
-      const payload = JSON.parse(raw);
-      if (!Array.isArray(payload)) {
-        throw new Error('payload is not an array');
-      }
-      return payload as HostdMetricEntry[];
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'unknown parse error';
-      throw new Error(
-        `${period} metrics JSON parse failed for ${url.toString()}: ${message}. Body: ${raw.slice(
-          0,
-          200,
-        )}`,
-      );
-    }
+    return (await getNodeArray(url.toString(), { authorization })) as HostdMetricEntry[];
   }
 
   private sectorsToBytes(value?: number | string): number | undefined {
@@ -849,34 +939,79 @@ export class SiaService {
     return this.hastingsToSiacoins(numeric);
   }
 
-  private computeStorageDelta(
-    entries?: HostdMetricEntry[],
-  ): { deltaBytes: number; sampleHours?: number } | undefined {
-    if (!entries || entries.length < 2) {
-      return undefined;
-    }
-
-    const sanitized = entries
-      .map((entry) => ({
-        timestamp: entry.timestamp ? Date.parse(entry.timestamp) : Number.NaN,
-        usedBytes: this.sectorsToBytes(entry.storage?.physicalSectors),
-      }))
+  /**
+   * The stored bytes of `entries` of `period` at the times they were current (see
+   * metricEntryAsOfMs), oldest first.
+   */
+  private storagePoints(
+    entries: HostdMetricEntry[] | undefined,
+    period: HostdMetricPeriod,
+    nowMs: number,
+  ): StoragePoint[] {
+    return (entries ?? [])
+      .map((entry) => {
+        const timestamp = entry.timestamp ? Date.parse(entry.timestamp) : Number.NaN;
+        return {
+          asOfMs: Number.isFinite(timestamp)
+            ? metricEntryAsOfMs(timestamp, period, nowMs)
+            : Number.NaN,
+          usedBytes: this.sectorsToBytes(entry.storage?.physicalSectors),
+        };
+      })
       .filter(
-        (entry): entry is { timestamp: number; usedBytes: number } =>
-          Number.isFinite(entry.timestamp) &&
-          typeof entry.usedBytes === 'number' &&
-          Number.isFinite(entry.usedBytes),
+        (point): point is StoragePoint =>
+          Number.isFinite(point.asOfMs) &&
+          typeof point.usedBytes === 'number' &&
+          Number.isFinite(point.usedBytes),
       )
-      .sort((a, b) => a.timestamp - b.timestamp);
+      .sort((a, b) => a.asOfMs - b.asOfMs);
+  }
 
-    if (sanitized.length < 2) {
+  /**
+   * The stored bytes at `target`, interpolated between the points around it, and the time they are
+   * for (`target`, or the one point there); undefined when the points do not reach both sides.
+   */
+  private interpolatedBaseline(
+    points: StoragePoint[],
+    target: number,
+  ): { baselineBytes: number; baselineMs: number } | undefined {
+    let lower: StoragePoint | undefined;
+    let upper: StoragePoint | undefined;
+    for (const point of points) {
+      if (point.asOfMs <= target) {
+        lower = point;
+      }
+      if (point.asOfMs >= target && !upper) {
+        upper = point;
+      }
+    }
+
+    if (!lower || !upper) {
+      return undefined;
+    }
+    if (upper.asOfMs === lower.asOfMs) {
+      return { baselineBytes: lower.usedBytes, baselineMs: lower.asOfMs };
+    }
+
+    const ratio = (target - lower.asOfMs) / (upper.asOfMs - lower.asOfMs);
+    return {
+      baselineBytes:
+        lower.usedBytes + (upper.usedBytes - lower.usedBytes) * Math.max(Math.min(ratio, 1), 0),
+      baselineMs: target,
+    };
+  }
+
+  private computeStorageDelta(
+    points: StoragePoint[],
+  ): { deltaBytes: number; sampleHours?: number } | undefined {
+    if (points.length < 2) {
       return undefined;
     }
 
-    const previous = sanitized[sanitized.length - 2];
-    const latest = sanitized[sanitized.length - 1];
+    const previous = points[points.length - 2];
+    const latest = points[points.length - 1];
     const deltaBytes = latest.usedBytes - previous.usedBytes;
-    const hoursRaw = (latest.timestamp - previous.timestamp) / MS_PER_HOUR;
+    const hoursRaw = (latest.asOfMs - previous.asOfMs) / MS_PER_HOUR;
     const sampleHours =
       Number.isFinite(hoursRaw) && hoursRaw > 0
         ? Math.max(Number(hoursRaw.toFixed(1)), 0)
@@ -888,65 +1023,25 @@ export class SiaService {
     };
   }
 
+  /** The change over the `windowMs` before `nowMs`, from the live total `currentUsedBytes`. */
   private computeLiveDelta(
     currentUsedBytes: number,
-    entries: HostdMetricEntry[] | undefined,
+    points: StoragePoint[],
     windowMs: number,
+    nowMs: number,
   ): { deltaBytes: number; sampleHours?: number } | undefined {
-    if (!entries || entries.length === 0 || !Number.isFinite(currentUsedBytes)) {
+    if (points.length === 0 || !Number.isFinite(currentUsedBytes)) {
       return undefined;
     }
 
-    const sanitized = entries
-      .map((entry) => ({
-        timestamp: entry.timestamp ? Date.parse(entry.timestamp) : Number.NaN,
-        usedBytes: this.sectorsToBytes(entry.storage?.physicalSectors),
-      }))
-      .filter(
-        (entry): entry is { timestamp: number; usedBytes: number } =>
-          Number.isFinite(entry.timestamp) &&
-          typeof entry.usedBytes === 'number' &&
-          Number.isFinite(entry.usedBytes),
-      )
-      .sort((a, b) => a.timestamp - b.timestamp);
-
-    if (sanitized.length === 0) {
+    const baseline = this.interpolatedBaseline(points, nowMs - windowMs);
+    if (!baseline) {
       return undefined;
     }
 
-    const target = Date.now() - windowMs;
-
-    let lower: { timestamp: number; usedBytes: number } | undefined;
-    let upper: { timestamp: number; usedBytes: number } | undefined;
-
-    for (const point of sanitized) {
-      if (point.timestamp <= target) {
-        lower = point;
-      }
-
-      if (point.timestamp >= target) {
-        upper = point;
-        break;
-      }
-    }
-
-    if (!lower || !upper) {
-      return undefined;
-    }
-
-    let baselineBytes = lower.usedBytes;
-    let baselineTimestamp = lower.timestamp;
-
-    if (upper.timestamp !== lower.timestamp) {
-      const ratio = (target - lower.timestamp) / (upper.timestamp - lower.timestamp);
-      baselineBytes =
-        lower.usedBytes + (upper.usedBytes - lower.usedBytes) * Math.max(Math.min(ratio, 1), 0);
-      baselineTimestamp = target;
-    }
-
-    const deltaBytes = currentUsedBytes - baselineBytes;
+    const deltaBytes = currentUsedBytes - baseline.baselineBytes;
     const sampleHours = Math.max(
-      Number(((Date.now() - baselineTimestamp) / MS_PER_HOUR).toFixed(1)),
+      Number(((nowMs - baseline.baselineMs) / MS_PER_HOUR).toFixed(1)),
       0,
     );
 
@@ -956,65 +1051,24 @@ export class SiaService {
     };
   }
 
-  private computeWindowDeltaFromEntries(
-    entries: HostdMetricEntry[] | undefined,
+  /** The change over the `windowMs` before the newest point, from the newest point's total. */
+  private computeWindowDelta(
+    points: StoragePoint[],
     windowMs: number,
   ): { deltaBytes: number; sampleHours?: number } | undefined {
-    if (!entries || entries.length < 2) {
+    if (points.length < 2) {
       return undefined;
     }
 
-    const sanitized = entries
-      .map((entry) => ({
-        timestamp: entry.timestamp ? Date.parse(entry.timestamp) : Number.NaN,
-        usedBytes: this.sectorsToBytes(entry.storage?.physicalSectors),
-      }))
-      .filter(
-        (entry): entry is { timestamp: number; usedBytes: number } =>
-          Number.isFinite(entry.timestamp) &&
-          typeof entry.usedBytes === 'number' &&
-          Number.isFinite(entry.usedBytes),
-      )
-      .sort((a, b) => a.timestamp - b.timestamp);
-
-    if (sanitized.length < 2) {
+    const latest = points[points.length - 1];
+    const baseline = this.interpolatedBaseline(points, latest.asOfMs - windowMs);
+    if (!baseline) {
       return undefined;
     }
 
-    const latest = sanitized[sanitized.length - 1];
-    const target = latest.timestamp - windowMs;
-
-    let lower: { timestamp: number; usedBytes: number } | undefined;
-    let upper: { timestamp: number; usedBytes: number } | undefined;
-
-    for (const point of sanitized) {
-      if (point.timestamp <= target) {
-        lower = point;
-      }
-
-      if (point.timestamp >= target) {
-        upper = point;
-        break;
-      }
-    }
-
-    if (!lower || !upper) {
-      return undefined;
-    }
-
-    let baselineBytes = lower.usedBytes;
-    let baselineTimestamp = lower.timestamp;
-
-    if (upper.timestamp !== lower.timestamp) {
-      const ratio = (target - lower.timestamp) / (upper.timestamp - lower.timestamp);
-      baselineBytes =
-        lower.usedBytes + (upper.usedBytes - lower.usedBytes) * Math.max(Math.min(ratio, 1), 0);
-      baselineTimestamp = target;
-    }
-
-    const deltaBytes = latest.usedBytes - baselineBytes;
+    const deltaBytes = latest.usedBytes - baseline.baselineBytes;
     const sampleHours = Math.max(
-      Number(((latest.timestamp - baselineTimestamp) / MS_PER_HOUR).toFixed(1)),
+      Number(((latest.asOfMs - baseline.baselineMs) / MS_PER_HOUR).toFixed(1)),
       0,
     );
 
@@ -1024,9 +1078,11 @@ export class SiaService {
     };
   }
 
+  /** The stored bytes at `baselineStartMs`: from the first daily entry with totals as of then or later. */
   private pickBaselineFromDaily(
     entries: HostdMetricEntry[] | undefined,
     baselineStartMs: number,
+    nowMs: number,
   ): number | undefined {
     if (!entries || entries.length === 0 || !Number.isFinite(baselineStartMs)) {
       return undefined;
@@ -1040,7 +1096,7 @@ export class SiaService {
       if (!Number.isFinite(timestamp)) {
         continue;
       }
-      if (timestamp >= baselineStartMs) {
+      if (metricEntryAsOfMs(timestamp, 'daily', nowMs) >= baselineStartMs) {
         const bytes = this.sectorsToBytes(entry.storage?.physicalSectors);
         if (typeof bytes === 'number' && Number.isFinite(bytes)) {
           return bytes;
@@ -1088,11 +1144,12 @@ export class SiaService {
   private resolveStorageBaselineBytes(params: {
     orderedDailyEntries?: HostdMetricEntry[];
     baselineStart: string;
+    nowMs: number;
   }): number | undefined {
     const orderedDailyEntries = params.orderedDailyEntries;
     const baselineMs = Date.parse(params.baselineStart);
 
-    const dailyBaseline = this.pickBaselineFromDaily(orderedDailyEntries, baselineMs);
+    const dailyBaseline = this.pickBaselineFromDaily(orderedDailyEntries, baselineMs, params.nowMs);
     if (dailyBaseline !== undefined) {
       return dailyBaseline;
     }
@@ -1110,27 +1167,31 @@ export class SiaService {
       rangeWindowMs?: number;
       rangeLabel?: string;
       metricEntries?: HostdMetricEntry[];
+      metricPeriod: HostdMetricPeriod;
+      nowMs: number;
     },
   ): SiaStorageUsage {
     const enriched: SiaStorageUsage = { ...usage };
+    const nowMs = options.nowMs;
 
     const orderedDailyEntries = this.orderMetricEntries(options.dailyEntries);
-    const orderedDayDeltaEntries = this.orderMetricEntries(options.dayDeltaEntries);
     const orderedMetricEntries = this.orderMetricEntries(options.metricEntries);
+    // Each series' storage totals at the times they were current (see metricEntryAsOfMs).
+    const quarterHourPoints = this.storagePoints(options.dayDeltaEntries, '15m', nowMs);
+    const dailyPoints = this.storagePoints(orderedDailyEntries, 'daily', nowMs);
+    const metricPoints = this.storagePoints(orderedMetricEntries, options.metricPeriod, nowMs);
 
     const dailyDelta =
-      this.computeWindowDeltaFromEntries(orderedDayDeltaEntries, MS_PER_DAY) ??
-      this.computeLiveDelta(usage.usedBytes, orderedDayDeltaEntries, MS_PER_DAY) ??
-      this.computeLiveDelta(usage.usedBytes, orderedDailyEntries, MS_PER_DAY) ??
-      this.computeStorageDelta(orderedDailyEntries?.slice(-2));
+      this.computeWindowDelta(quarterHourPoints, MS_PER_DAY) ??
+      this.computeLiveDelta(usage.usedBytes, quarterHourPoints, MS_PER_DAY, nowMs) ??
+      this.computeLiveDelta(usage.usedBytes, dailyPoints, MS_PER_DAY, nowMs) ??
+      this.computeStorageDelta(this.storagePoints(orderedDailyEntries?.slice(-2), 'daily', nowMs));
     if (dailyDelta) {
       enriched.changeDayBytes = dailyDelta.deltaBytes;
       enriched.changeDaySampleHours = dailyDelta.sampleHours;
     }
 
-    const rollingWindowMs = ROLLING_WINDOW_DAYS * MS_PER_DAY - this.getLocalTimezoneOffsetMs();
-    const monthDelta =
-      this.computeWindowDeltaFromEntries(orderedDailyEntries, rollingWindowMs) ?? undefined;
+    const monthDelta = this.computeWindowDelta(dailyPoints, ROLLING_WINDOW_DAYS * MS_PER_DAY);
 
     if (monthDelta) {
       enriched.changeMonthBytes = monthDelta.deltaBytes;
@@ -1138,6 +1199,7 @@ export class SiaService {
       const baselineBytes = this.resolveStorageBaselineBytes({
         orderedDailyEntries,
         baselineStart: options.rollingBaselineStart,
+        nowMs,
       });
 
       if (baselineBytes !== undefined) {
@@ -1148,6 +1210,7 @@ export class SiaService {
     const calendarBaselineBytes = this.resolveStorageBaselineBytes({
       orderedDailyEntries,
       baselineStart: options.calendarBaselineStart,
+      nowMs,
     });
 
     if (calendarBaselineBytes !== undefined) {
@@ -1159,13 +1222,14 @@ export class SiaService {
     }
 
     if (options.rangeWindowMs !== undefined && options.rangeWindowMs > 0) {
+      const rangeWindowMs = options.rangeWindowMs;
+      // From the finest series that covers the window.
+      const finestFirst = [quarterHourPoints, dailyPoints, metricPoints];
       const rangeDelta =
-        this.computeWindowDeltaFromEntries(orderedDayDeltaEntries, options.rangeWindowMs) ??
-        this.computeWindowDeltaFromEntries(orderedDailyEntries, options.rangeWindowMs) ??
-        this.computeWindowDeltaFromEntries(orderedMetricEntries, options.rangeWindowMs) ??
-        this.computeLiveDelta(usage.usedBytes, orderedDayDeltaEntries, options.rangeWindowMs) ??
-        this.computeLiveDelta(usage.usedBytes, orderedDailyEntries, options.rangeWindowMs) ??
-        this.computeLiveDelta(usage.usedBytes, orderedMetricEntries, options.rangeWindowMs);
+        finestFirst.map((points) => this.computeWindowDelta(points, rangeWindowMs)).find(Boolean) ??
+        finestFirst
+          .map((points) => this.computeLiveDelta(usage.usedBytes, points, rangeWindowMs, nowMs))
+          .find(Boolean);
       if (rangeDelta) {
         enriched.changeRangeBytes = rangeDelta.deltaBytes;
         enriched.changeRangeSampleHours = rangeDelta.sampleHours;
@@ -1206,39 +1270,89 @@ export class SiaService {
     }
   }
 
-  private async fetchWalletSummary(
-    host: string,
-    authorization?: string,
-  ): Promise<SiaWalletSummary> {
-    const response = await fetch(`http://${host}/wallet`, {
-      headers: authorization ? { Authorization: authorization } : undefined,
-    });
-
-    if (!response.ok) {
-      throw new Error(`Wallet request failed with status ${response.status}`);
+  /**
+   * hostd `GET /api/wallet`: `{"spendable","confirmed","unconfirmed","immature"}` in hastings (older
+   * hostd has no `immature`). A reply without the three balances is not a hostd wallet, so it
+   * fails here and the next source is used instead of an all-zero wallet.
+   */
+  private async fetchHostdWallet(host: string, authorization?: string): Promise<SiaWalletSummary> {
+    const payload = await getNodeObject(`${nodeBaseUrl(host)}/api/wallet`, { authorization });
+    const confirmed = hastingsToSiacoinsOrUndefined(payload.confirmed);
+    const spendable = hastingsToSiacoinsOrUndefined(payload.spendable);
+    const unconfirmed = hastingsToSiacoinsOrUndefined(payload.unconfirmed);
+    if (confirmed === undefined || spendable === undefined || unconfirmed === undefined) {
+      invalidResponse('Wallet payload is incomplete');
     }
 
-    const payload = (await response.json()) as {
-      confirmedSiacoinBalance?: number | string;
-      spendableSiacoinBalance?: number | string;
-      unconfirmedIncomingSiacoinBalance?: number | string;
-      unconfirmedOutgoingSiacoinBalance?: number | string;
+    return {
+      confirmed,
+      spendable,
+      unconfirmedIncoming: unconfirmed,
+      unconfirmedOutgoing: Math.max(confirmed - spendable, 0),
+      immature: hastingsToSiacoinsOrUndefined(payload.immature),
     };
+  }
 
-    const toSiacoin = (value?: number | string): number => {
-      if (value === undefined || value === null) {
-        return 0;
-      }
-      const numeric = typeof value === 'string' ? Number(value) : value;
-      return this.hastingsToSiacoins(numeric);
-    };
+  /**
+   * A separately configured wallet service (`walletHost`) at `GET /wallet` with
+   * `confirmedSiacoinBalance`-style keys. Missing balances fail instead of reading as 0 SC.
+   */
+  private async fetchWalletHostSummary(
+    walletHost: string,
+    authorization?: string,
+  ): Promise<SiaWalletSummary> {
+    const payload = await getNodeObject(`${nodeBaseUrl(walletHost)}/wallet`, { authorization });
+    const confirmed = hastingsToSiacoinsOrUndefined(payload.confirmedSiacoinBalance);
+    const spendable = hastingsToSiacoinsOrUndefined(payload.spendableSiacoinBalance);
+    if (confirmed === undefined || spendable === undefined) {
+      invalidResponse('Wallet payload is incomplete');
+    }
 
     return {
-      confirmed: toSiacoin(payload.confirmedSiacoinBalance),
-      spendable: toSiacoin(payload.spendableSiacoinBalance),
-      unconfirmedIncoming: toSiacoin(payload.unconfirmedIncomingSiacoinBalance),
-      unconfirmedOutgoing: toSiacoin(payload.unconfirmedOutgoingSiacoinBalance),
+      confirmed,
+      spendable,
+      unconfirmedIncoming: hastingsToSiacoins(payload.unconfirmedIncomingSiacoinBalance),
+      unconfirmedOutgoing: hastingsToSiacoins(payload.unconfirmedOutgoingSiacoinBalance),
     };
+  }
+
+  /**
+   * The configured wallet service first (when set), then hostd's own wallet API. A walletHost that
+   * cannot be requested (an address that does not parse) is skipped like an unreachable one, but
+   * logged once as a config mistake, since the node itself still shows as OK.
+   */
+  private async fetchWalletSummary(
+    nodeConfig: SiaNodeConfig,
+    authorization?: string,
+  ): Promise<SiaWalletSummary | undefined> {
+    if (nodeConfig.walletHost) {
+      try {
+        return await this.fetchWalletHostSummary(nodeConfig.walletHost, authorization);
+      } catch (error) {
+        if (error instanceof NodeRequestError && error.kind === 'invalid_endpoint') {
+          this.reportUnusableWalletHost(nodeConfig, error.message);
+        }
+        // Fall through to hostd's wallet.
+      }
+    }
+    try {
+      return await this.fetchHostdWallet(nodeConfig.host, authorization);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The message is fixed text of the request layer; the walletHost value is never logged. */
+  private reportUnusableWalletHost(nodeConfig: SiaNodeConfig, message: string): void {
+    const key = `${nodeConfig.host}\n${nodeConfig.walletHost}`;
+    if (this.reportedWalletHosts.has(key)) {
+      return;
+    }
+    this.reportedWalletHosts.add(key);
+    this.logger.warn(
+      `walletHost of Sia node ${displayNodeHost(nodeConfig.host)} is not used: ${message}. ` +
+        "The wallet shown is hostd's.",
+    );
   }
 
   async fetchSummary(options?: { month?: string; range?: SiaSummaryRange }): Promise<SiaSummary> {
@@ -1257,8 +1371,10 @@ export class SiaService {
           nodeConfig.username,
           nodeConfig.password,
         );
+        let baseUrl: string | undefined;
 
         try {
+          baseUrl = nodeBaseUrl(host);
           const metricEntriesPromise = this.fetchHostdMetrics(
             host,
             config.metricPeriod,
@@ -1309,9 +1425,11 @@ export class SiaService {
               liveStorageSnapshotPromise,
             ]);
 
+          // The entries of the periods still running hold the totals as of now (metricEntryAsOfMs).
+          const nowMs = Date.now();
           const orderedMetricEntries = this.orderMetricEntries(metricEntries);
           if (!orderedMetricEntries || orderedMetricEntries.length === 0) {
-            throw new Error(`${config.metricPeriod} metrics payload is incomplete`);
+            invalidResponse(`${config.metricPeriod} metrics payload is incomplete`);
           }
 
           const currentEntry = orderedMetricEntries[orderedMetricEntries.length - 1];
@@ -1320,26 +1438,38 @@ export class SiaService {
 
           if (config.mode === 'calendar') {
             if (orderedMetricEntries.length < 2) {
-              throw new Error('Monthly metrics payload is incomplete');
+              invalidResponse('Monthly metrics payload is incomplete');
             }
             baselineEntry = orderedMetricEntries[orderedMetricEntries.length - 2];
           } else if (config.range === 'all') {
             resolvedPeriodStart = this.getEarliestMetricTimestamp(orderedMetricEntries) ?? '';
           } else {
-            baselineEntry = this.pickMetricBaselineEntry(orderedMetricEntries, config.periodStart);
+            // The last entry with totals as of the period start or earlier, so a range covers at
+            // least its length and at most one period more.
+            baselineEntry = this.pickMetricBaselineEntry(
+              orderedMetricEntries,
+              config.metricPeriod,
+              config.periodStart,
+              nowMs,
+            );
           }
 
           const { metrics, totals } = this.buildMetricRowsFromSnapshots(currentEntry, baselineEntry);
-          let currentMonthSnapshot: SiaMetricSnapshot = totals.current;
+          let currentMonthSnapshot: SiaMetricSnapshot | undefined = totals.current;
           if (config.mode === 'range') {
-            currentMonthSnapshot =
-              this.buildCurrentMonthMetricSnapshot(dailyEntries, calendarBaselineStart) ??
-              this.buildCurrentMonthMetricSnapshot(orderedMetricEntries, calendarBaselineStart) ??
-              this.buildCurrentMonthMetricSnapshot(
-                currentMonthMetricEntries,
-                calendarBaselineStart,
-              ) ??
-              { potential: 0, earned: 0 };
+            currentMonthSnapshot = this.currentMonthInRange(
+              [
+                ['daily', dailyEntries, config.dailyHistoryStart],
+                [config.metricPeriod, orderedMetricEntries, config.metricStart ?? ''],
+                [
+                  'monthly',
+                  currentMonthMetricEntries,
+                  this.getPreviousPeriodStart(calendarBaselineStart),
+                ],
+              ],
+              calendarBaselineStart,
+              nowMs,
+            );
           }
           const contractBaselineEntry =
             baselineEntry ??
@@ -1368,6 +1498,8 @@ export class SiaService {
                 rangeWindowMs: this.getRangeWindowMs(config),
                 rangeLabel: config.mode === 'range' ? config.periodShortLabel : undefined,
                 metricEntries: orderedMetricEntries,
+                metricPeriod: config.metricPeriod,
+                nowMs,
               });
             } catch {
               storage = undefined;
@@ -1383,14 +1515,9 @@ export class SiaService {
             this.extractWalletBalance(dayDeltaEntries) ??
             this.extractWalletBalance(dailyEntries) ??
             this.extractWalletBalance(orderedMetricEntries);
-          const walletHost = nodeConfig.walletHost ?? host;
-          try {
-            wallet = await this.fetchWalletSummary(walletHost, authorization);
-            if (lockedCollateral !== undefined) {
-              wallet.lockedCollateral = lockedCollateral;
-            }
-          } catch (error) {
-            wallet = undefined;
+          wallet = await this.fetchWalletSummary(nodeConfig, authorization);
+          if (wallet && lockedCollateral !== undefined) {
+            wallet.lockedCollateral = lockedCollateral;
           }
 
           if (!wallet && metricsWalletBalance !== undefined) {
@@ -1405,7 +1532,8 @@ export class SiaService {
 
           return {
             node: {
-              host,
+              host: displayNodeHost(host),
+              baseUrl,
               status: 'ok',
               metrics,
               totals: {
@@ -1419,13 +1547,12 @@ export class SiaService {
             resolvedPeriodStart,
           };
         } catch (error) {
-          const message = error instanceof Error ? error.message : 'Unknown error';
-
           return {
             node: {
-              host,
+              host: displayNodeHost(host),
+              baseUrl,
               status: 'error',
-              message,
+              ...toNodeFailure(error),
             },
           };
         }
@@ -1574,6 +1701,10 @@ export class SiaService {
         contracts: undefined,
       },
     );
+    // Unknown unless every node that answered knows its month: a partial sum would understate it.
+    if (nodes.some((node) => node.status === 'ok' && !node.totals.currentMonth)) {
+      aggregate.currentMonth = undefined;
+    }
 
     return {
       periodStart: resolvedPeriodStart,
@@ -1589,9 +1720,10 @@ export class SiaService {
   }
 
   private getMockSiaSummary(options?: { month?: string; range?: SiaSummaryRange }): SiaSummary {
-    const now = new Date();
-    const periodStart = options?.month ? this.parsePeriodFromMonth(options.month).periodStart : this.getPeriodStart();
-    const periodEnd = options?.month ? this.parsePeriodFromMonth(options.month).periodEnd : this.toIsoString(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)));
+    // The period and its labels come from the same config as a live request, so a range such as
+    // 7d spans its days and not the calendar month. "All" has no metric history to start from,
+    // so it stays unbounded, as a live node without history.
+    const config = this.buildSummaryRequestConfig(options);
 
     const mockNodes: SiaNodeStatus[] = [
       {
@@ -1658,6 +1790,8 @@ export class SiaService {
         host: 'demo-sia-3.example.com:9990',
         status: 'error',
         message: 'Connection timeout',
+        errorKind: 'timeout',
+        health: 'offline',
       },
     ];
 
@@ -1679,12 +1813,14 @@ export class SiaService {
     };
 
     return {
-      periodStart,
-      periodEnd,
-      periodMode: options?.range ? 'range' : 'calendar',
-      periodLabel: options?.range ? `Last ${options.range}` : 'Current month',
-      periodShortLabel: options?.range || 'Current',
-      nodes: mockNodes,
+      periodStart: config.periodStart,
+      periodEnd: config.periodEnd,
+      periodMode: config.mode,
+      periodLabel: config.periodLabel,
+      periodShortLabel: config.periodShortLabel,
+      previousPeriodStart: config.previousPeriodStart,
+      rollingBaselineStart: config.rollingBaselineStart,
+      nodes: mockNodes.map((node) => ({ ...node, baseUrl: nodeBaseUrl(node.host) })),
       aggregate,
     };
   }

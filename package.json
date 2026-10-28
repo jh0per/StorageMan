@@ -2,6 +2,9 @@
   "name": "storageman-app",
   "version": "0.0.1",
   "description": "NestJS dashboard for Storj and Sia node revenue, storage, bandwidth, wallet, and contract metrics.",
+  "engines": {
+    "node": "^20.11.1 || >=22"
+  },
   "scripts": {
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
