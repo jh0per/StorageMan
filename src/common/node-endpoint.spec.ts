@@ -1,4 +1,4 @@
-import { displayNodeHost, nodeBaseUrl, parseNodeEndpoint } from './node-endpoint';
+import { displayNodeHost, nodeBaseUrl, nodeEndpointKey, parseNodeEndpoint } from './node-endpoint';
 import { NodeRequestError } from './node-request';
 
 describe('parseNodeEndpoint', () => {
@@ -148,6 +148,42 @@ describe('nodeBaseUrl', () => {
       'Invalid node address: use host:port, https://host:port or [IPv6]:port',
     );
   });
+});
+
+describe('nodeEndpointKey', () => {
+  it.each([
+    ['192.0.2.1:9980', 'http://192.0.2.1:9980'],
+    ['http://192.0.2.1:9980', '192.0.2.1:9980'],
+    ['HTTP://192.0.2.1:9980/', ' 192.0.2.1:9980 '],
+    ['Node.Example:9980', 'node.example:9980'],
+    ['http://node.example', 'node.example:80'],
+    ['https://node.example', 'https://node.example:443/'],
+    ['[FD00:0:0::5]:9980', 'http://[fd00::5]:9980'],
+  ])('%p and %p are the same node', (left, right) => {
+    expect(nodeEndpointKey(left)).toBeDefined();
+    expect(nodeEndpointKey(left)).toBe(nodeEndpointKey(right));
+  });
+
+  it.each([
+    ['192.0.2.1:9980', 'https://192.0.2.1:9980'],
+    ['192.0.2.1:9980', '192.0.2.1:9981'],
+    ['192.0.2.1:9980', '192.0.2.2:9980'],
+    ['http://node.example', 'https://node.example'],
+  ])('%p and %p are different nodes', (left, right) => {
+    expect(nodeEndpointKey(left)).not.toBe(nodeEndpointKey(right));
+  });
+
+  it('is scheme, host as fetch reads it and port', () => {
+    expect(nodeEndpointKey('Node.Example:9980')).toBe('http://node.example:9980');
+    expect(nodeEndpointKey('https://[FD00::5]')).toBe('https://[fd00::5]:443');
+  });
+
+  it.each(['fd00::5:9980', 'node.example', 'user:secret@node.example:9980', ''])(
+    'is undefined for %p, which does not parse',
+    (raw) => {
+      expect(nodeEndpointKey(raw)).toBeUndefined();
+    },
+  );
 });
 
 describe('displayNodeHost', () => {

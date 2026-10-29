@@ -1,4 +1,7 @@
 import { Logger } from '@nestjs/common';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { SiaService } from './sia.service';
 import { SiaNodeStatus, SiaNodeSuccess, SiaSummary } from './sia.types';
 
@@ -321,6 +324,210 @@ describe('Sia node addresses that do not parse', () => {
       expect(node.baseUrl).toBeUndefined();
     },
   );
+});
+
+describe('Sia hostd discovery', () => {
+  let root: string;
+
+  const basic = (password: string) =>
+    `Basic ${Buffer.from(`:${password}`, 'utf8').toString('base64')}`;
+
+  /** `<root>/sia_<port>/hostd.yml` holding `password`. */
+  function hostd(port: number, password: string): void {
+    mkdirSync(join(root, `sia_${port}`));
+    writeFileSync(
+      join(root, `sia_${port}`, 'hostd.yml'),
+      `http:\n  address: :9980\n  password: "${password}"\n`,
+    );
+  }
+
+  /** Every Logger call, to check that no password or discovered address is logged. */
+  function spyOnLogger(): jest.SpyInstance[] {
+    return (['log', 'warn', 'error', 'debug', 'verbose'] as const).map((level) =>
+      jest.spyOn(Logger.prototype, level).mockImplementation(() => undefined),
+    );
+  }
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'storageman-sia-roots-'));
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('merges discovered nodes into SIA_NODES_JSON: same address in place, new ones after', async () => {
+    hostd(9981, 'change-me-b');
+    hostd(9980, 'change-me-a');
+    configure(
+      { host: 'http://127.0.0.1:9980', walletHost: 'wallet.example:9990' },
+      { host: '192.0.2.40:9980' },
+    );
+    mockEnv.SIA_DISCOVERY_ROOTS = `${join(root, 'missing')}, ${root},${root}`;
+    const requests = mockFetch({
+      'http://127.0.0.1:9980': hostdRoute(),
+      'http://127.0.0.1:9981': hostdRoute(),
+      'http://192.0.2.40:9980': hostdRoute(),
+      'http://wallet.example:9990': () => json({}, 404),
+    });
+
+    const summary = await fetchSummary();
+
+    expect(summary.nodes.map((node) => [node.host, node.status])).toEqual([
+      ['127.0.0.1:9980', 'ok'],
+      ['192.0.2.40:9980', 'ok'],
+      ['127.0.0.1:9981', 'ok'],
+    ]);
+    const authorizationsOf = (origin: string) =>
+      new Set(
+        requests
+          .filter((request) => request.url.startsWith(`${origin}/`))
+          .map((request) => request.authorization),
+      );
+    // The discovered password replaces the configured one; the configured walletHost stays.
+    expect(authorizationsOf('http://127.0.0.1:9980')).toEqual(new Set([basic('change-me-a')]));
+    expect(authorizationsOf('http://wallet.example:9990')).toEqual(new Set([basic('change-me-a')]));
+    expect(authorizationsOf('http://127.0.0.1:9981')).toEqual(new Set([basic('change-me-b')]));
+    expect(authorizationsOf('http://192.0.2.40:9980')).toEqual(new Set([AUTH]));
+    expect(JSON.stringify(summary)).not.toContain('change-me');
+  });
+
+  it('merges discovered nodes into the legacy flat variables', async () => {
+    hostd(9980, 'change-me-a');
+    hostd(9981, 'change-me-b');
+    mockEnv.SIA_HOSTS = '127.0.0.1:9980';
+    mockEnv.SIA_PASSWORD = 'secret';
+    mockEnv.SIA_WALLET_HOST = 'wallet.example:9990';
+    mockEnv.SIA_DISCOVERY_ROOTS = root;
+    const requests = mockFetch({
+      'http://127.0.0.1:9980': hostdRoute(),
+      'http://127.0.0.1:9981': hostdRoute(),
+      'http://wallet.example:9990': () => json({}, 404),
+    });
+
+    const summary = await fetchSummary();
+
+    expect(summary.nodes.map((node) => node.host)).toEqual(['127.0.0.1:9980', '127.0.0.1:9981']);
+    const wallet = requests.find((request) =>
+      request.url.startsWith('http://wallet.example:9990/'),
+    );
+    expect(wallet?.authorization).toBe(basic('change-me-a'));
+    expect(requests.some((request) => request.authorization === AUTH)).toBe(false);
+  });
+
+  it('serves only discovered nodes when none is configured', async () => {
+    hostd(9980, 'change-me-a');
+    mockEnv.SIA_DISCOVERY_ROOTS = root;
+    mockFetch({ 'http://127.0.0.1:9980': hostdRoute() });
+
+    const summary = await fetchSummary();
+
+    expect(summary.nodes.map((node) => [node.host, node.status])).toEqual([
+      ['127.0.0.1:9980', 'ok'],
+    ]);
+  });
+
+  it.each([undefined, '', '   '])('a SIA_DISCOVERY_HOST of %p means 127.0.0.1', async (host) => {
+    hostd(9980, 'change-me-a');
+    mockEnv.SIA_DISCOVERY_ROOTS = root;
+    mockEnv.SIA_DISCOVERY_HOST = host;
+    mockFetch({ 'http://127.0.0.1:9980': hostdRoute() });
+
+    const [node] = (await fetchSummary()).nodes;
+
+    expect(node).toMatchObject({ host: '127.0.0.1:9980', status: 'ok' });
+  });
+
+  it('requests a bracketed IPv6 SIA_DISCOVERY_HOST', async () => {
+    hostd(9980, 'change-me-a');
+    mockEnv.SIA_DISCOVERY_ROOTS = root;
+    mockEnv.SIA_DISCOVERY_HOST = ' [fd00::5] ';
+    const requests = mockFetch({ 'http://[fd00::5]:9980': hostdRoute() });
+
+    const [node] = (await fetchSummary()).nodes;
+
+    expect(node).toMatchObject({
+      host: '[fd00::5]:9980',
+      baseUrl: 'http://[fd00::5]:9980',
+      status: 'ok',
+    });
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every((request) => request.authorization === basic('change-me-a'))).toBe(true);
+  });
+
+  it('an IPv6 SIA_DISCOVERY_HOST without brackets is misconfigured, never requested, nothing logged', async () => {
+    const logger = spyOnLogger();
+    hostd(9980, 'change-me-a');
+    configure({ host: '192.0.2.40:9980' });
+    mockEnv.SIA_DISCOVERY_ROOTS = root;
+    mockEnv.SIA_DISCOVERY_HOST = 'fd00::5';
+    const requests = mockFetch({ 'http://192.0.2.40:9980': hostdRoute() });
+
+    const summary = await fetchSummary();
+
+    expect(summary.nodes[0].status).toBe('ok');
+    expect(summary.nodes[1]).toMatchObject({
+      host: 'fd00::5:9980',
+      status: 'error',
+      errorKind: 'invalid_endpoint',
+      health: 'misconfigured',
+      message: 'Invalid node address: use host:port, https://host:port or [IPv6]:port',
+    });
+    expect(summary.nodes[1].baseUrl).toBeUndefined();
+    expect(requests.every((request) => request.url.startsWith('http://192.0.2.40:9980/'))).toBe(
+      true,
+    );
+    expect(JSON.stringify(summary)).not.toContain('change-me');
+    for (const spy of logger) {
+      expect(spy).not.toHaveBeenCalled();
+    }
+  });
+
+  it('scans on every request, so a node added later shows without a restart', async () => {
+    mockEnv.SIA_DISCOVERY_ROOTS = root;
+    mockFetch({ 'http://127.0.0.1:9980': hostdRoute(), 'http://127.0.0.1:9981': hostdRoute() });
+    const service = new SiaService();
+    hostd(9980, 'change-me-a');
+
+    const before = await service.fetchSummary();
+    hostd(9981, 'change-me-b');
+    const after = await service.fetchSummary();
+
+    expect(before.nodes.map((node) => node.host)).toEqual(['127.0.0.1:9980']);
+    expect(after.nodes.map((node) => node.host)).toEqual(['127.0.0.1:9980', '127.0.0.1:9981']);
+  });
+
+  it('announces a discovered node with its own password', async () => {
+    hostd(9980, 'change-me-a');
+    hostd(9981, 'change-me-b');
+    mockEnv.SIA_DISCOVERY_ROOTS = root;
+    const requests = mockFetch({ 'http://127.0.0.1:9981': hostdRoute() });
+
+    await expect(new SiaService().announceHost('127.0.0.1:9981')).resolves.toEqual({
+      host: '127.0.0.1:9981',
+      success: true,
+    });
+    expect(requests).toEqual([
+      {
+        url: 'http://127.0.0.1:9981/api/settings/announce',
+        method: 'POST',
+        authorization: basic('change-me-b'),
+      },
+    ]);
+  });
+
+  it('leaves the configured nodes alone without SIA_DISCOVERY_ROOTS', async () => {
+    hostd(9980, 'change-me-a');
+    configure({ host: 'http://127.0.0.1:9980' });
+    mockEnv.SIA_DISCOVERY_ROOTS = ' , ';
+    const requests = mockFetch({ 'http://127.0.0.1:9980': hostdRoute() });
+
+    const summary = await fetchSummary();
+
+    expect(summary.nodes.map((node) => node.host)).toEqual(['http://127.0.0.1:9980']);
+    expect(requests.every((request) => request.authorization === AUTH)).toBe(true);
+  });
 });
 
 describe('Sia node failures', () => {

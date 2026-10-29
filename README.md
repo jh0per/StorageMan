@@ -38,6 +38,8 @@ StorageMan is a NestJS dashboard for monitoring Storj storage nodes and Sia host
 
    - `STORJ_NODES_JSON` – Preferred option. JSON array of Storj node configs. Today each entry only needs `host`. Wrap the JSON in single quotes in `.env`.
    - `SIA_NODES_JSON` – Preferred option. JSON array of Sia node configs with `host`, optional `username`, optional `password`, and optional `walletHost`. Wrap the JSON in single quotes in `.env`.
+   - `SIA_DISCOVERY_ROOTS` – Optional. Comma-separated directories to scan for local hostd nodes (`sia_<port>/hostd.yml`). The nodes found are merged into the Sia node list on every request, so a new node shows without editing the list or restarting. See [Local hostd Discovery](#local-hostd-discovery).
+   - `SIA_DISCOVERY_HOST` – Optional. Host the discovered nodes are requested on, with the port of each node (default `127.0.0.1`). An IPv6 address goes in brackets: `[fd00::5]`.
    - Legacy flat env vars still work as fallback, but the public config format is the JSON form above.
    - `NODE_REQUEST_TIMEOUT_MS` – Optional. Time limit for each request to a node (default `30000`). A node that does not answer in time is shown as Offline instead of holding up the whole dashboard.
    - `PORT` – Optional. Port of the dashboard (default `3000`).
@@ -71,6 +73,28 @@ Without a scheme the port is required: a bare host such as `192.168.1.5` or `sto
 
 - hostd's API password is sent as HTTP Basic auth on every Sia request. Over plain http anyone on the network path can read it, so use `https://` (for example a TLS reverse proxy in front of hostd) or a VPN for nodes outside your own network.
 - A node behind a certificate from a private CA or a self-signed certificate needs that CA trusted by Node.js: start the server with `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` in its environment, e.g. `NODE_EXTRA_CA_CERTS=/path/to/ca.pem npm run start:prod`. Node.js reads it only at startup, so it cannot go in `.env`. Without it the node is shown as misconfigured with a certificate error.
+
+## Local hostd Discovery
+
+With `SIA_DISCOVERY_ROOTS` set, every Sia request also scans those directories for hostd nodes, for example nodes run next to the dashboard with their API published on the port in the directory name:
+
+```env
+SIA_DISCOVERY_ROOTS=/srv/sia,/var/lib/sia
+SIA_DISCOVERY_HOST=127.0.0.1
+```
+
+```text
+/srv/sia/sia_9980/hostd.yml   ->  127.0.0.1:9980
+/srv/sia/sia_9990/hostd.yml   ->  127.0.0.1:9990
+/var/lib/sia/sia_10000        ->  127.0.0.1:10000 (a symbolic link to a node directory)
+```
+
+- The roots are scanned in the order given, each once. A root that does not exist or cannot be read is skipped. In a root every directory or symbolic link named `sia_<digits>` is a node, in numeric order; other entries are ignored.
+- Of each `hostd.yml` only `address` and `password` of the top-level `http:` section are read: the same keys in another section such as `syncer:` do not count, quotes are removed, comments are ignored and the first value wins. A node without a readable `hostd.yml` is skipped; one without a password is requested without one.
+- The port is the number in the directory name, the port the node's API is published on (`sia_19980` with `address: :9980` inside a container is port 19980). Only when that number is not a port (0 or over 65535) does the port at the end of `http.address` count; a node with neither is skipped.
+- A discovered node has the address `<SIA_DISCOVERY_HOST>:<port>`, an empty username and the password of its `hostd.yml`. It takes the place of a configured node (`SIA_NODES_JSON` or the legacy variables) at the same address, compared as scheme, host and port (`127.0.0.1:9980` and `http://127.0.0.1:9980` are one node, `https://127.0.0.1:9980` another): it keeps that node's place and `walletHost` and replaces its address, username and password. The other discovered nodes follow the configured ones. Each discovered node is listed and requested once: found twice (under two roots) it has the password found last, and when the configured list has its address more than once (in the same or another spelling) it takes the place of the first entry with the `walletHost` of the last one, and the other entries are left out. A node configured more than once (in the same or another spelling) is likewise listed once, at the place of its first entry with the address, password and `walletHost` of its last one, with or without discovery, as the first version of discovery did.
+- An address that cannot be read, such as an IPv6 `SIA_DISCOVERY_HOST` without brackets (`fd00::5`), marks each discovered node as misconfigured (`errorKind: invalid_endpoint`) and it is never requested, as with a configured address. Discovery logs nothing, so neither a password nor an address from `hostd.yml` reaches the log.
+- The dashboard needs read access to the roots and the `hostd.yml` files. Their passwords are sent as HTTP Basic auth like configured ones (see above).
 
 ## Serving the Dashboard over HTTPS
 
@@ -112,7 +136,7 @@ TLS_KEY_FILE=/etc/storageman/privkey.pem
 
 - `src/common` contains the shared node address parser (`node-endpoint.ts`), the node request helper with typed failures and timeouts (`node-request.ts`), and payload number parsing (`node-numbers.ts`).
 - `src/storj` contains the Storj API controller, summary service, lifetime and bandwidth calculations, and response types.
-- `src/sia` contains the Sia API controller, summary service, announce endpoint, and response types.
+- `src/sia` contains the Sia API controller, summary service, announce endpoint, local hostd discovery (`sia-discovery.ts`), and response types.
 - `public` holds the static HTML, CSS, and JavaScript dashboard assets.
 
 The frontend consumes the backend endpoints at `/api/storj` and `/api/sia` to render the latest data.

@@ -155,6 +155,21 @@ export function nodeBaseUrl(raw: string): string {
 }
 
 /**
+ * One text for every spelling of the same node address: `scheme://host:port` with the host as fetch
+ * reads it (lower case, IPv6 in canonical form), so `192.0.2.1:9980`, `http://192.0.2.1:9980/`
+ * and `HTTP://192.0.2.1:9980` give the same key, `https://192.0.2.1:9980` another, and
+ * `http://node.example` the key of `node.example:80`. Undefined when the address does not parse.
+ */
+export function nodeEndpointKey(raw: string): string | undefined {
+  const endpoint = parseNodeEndpoint(raw);
+  if (!endpoint) {
+    return undefined;
+  }
+  // parseNodeEndpoint has checked that the URL parses; hostname keeps the IPv6 brackets.
+  return `${endpoint.scheme}://${new URL(endpoint.baseUrl).hostname}:${endpoint.port}`;
+}
+
+/**
  * The configured address as the API and the UI show it. A valid address never has user
  * credentials; in any other value everything up to the last `@` is masked, so a password typed
  * into the address does not reach the dashboard.

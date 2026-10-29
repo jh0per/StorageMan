@@ -16,6 +16,13 @@ import {
 } from '../common/node-request';
 import { getRuntimeEnv } from '../runtime-env';
 import {
+  DEFAULT_DISCOVERY_HOST,
+  discoverSiaNodes,
+  mergeDiscoveredNodes,
+  parseDiscoveryRoots,
+  SiaNodeConfig,
+} from './sia-discovery';
+import {
   SiaContractSummary,
   SiaMetricRow,
   SiaMetricSnapshot,
@@ -171,13 +178,6 @@ interface HostdMetricEntry {
   };
 }
 
-interface SiaNodeConfig {
-  host: string;
-  username?: string;
-  password?: string;
-  walletHost?: string;
-}
-
 @Injectable()
 export class SiaService {
   private readonly logger = new Logger(SiaService.name);
@@ -272,9 +272,21 @@ export class SiaService {
     return basicAuthorization(username, password);
   }
 
+  /**
+   * Every node to request: the configured ones merged with the hostd nodes found under
+   * SIA_DISCOVERY_ROOTS (see mergeDiscoveredNodes). Discovery reads the disk on every call, so a
+   * request resolves the list once.
+   */
+  private resolveNodes(): SiaNodeConfig[] {
+    const roots = parseDiscoveryRoots(getRuntimeEnv('SIA_DISCOVERY_ROOTS'));
+    const host = getRuntimeEnv('SIA_DISCOVERY_HOST')?.trim() || DEFAULT_DISCOVERY_HOST;
+    const discovered = roots.length > 0 ? discoverSiaNodes(roots, host) : [];
+    return mergeDiscoveredNodes(this.configuredNodes, discovered);
+  }
+
   private getConfiguredNode(host: string): SiaNodeConfig {
     const normalizedHost = host.trim();
-    const node = this.configuredNodes.find((entry) => entry.host === normalizedHost);
+    const node = this.resolveNodes().find((entry) => entry.host === normalizedHost);
     if (!node) {
       throw new NotFoundException(`Sia host ${normalizedHost} is not configured`);
     }
@@ -1365,7 +1377,7 @@ export class SiaService {
       config.mode === 'calendar' ? config.periodStart : this.getPeriodStart();
 
     const nodeResults = await Promise.all(
-      this.configuredNodes.map(async (nodeConfig): Promise<SiaNodeComputation> => {
+      this.resolveNodes().map(async (nodeConfig): Promise<SiaNodeComputation> => {
         const host = nodeConfig.host;
         const authorization = this.buildAuthorizationHeader(
           nodeConfig.username,
